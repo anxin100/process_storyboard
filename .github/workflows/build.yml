@@ -149,6 +149,13 @@ jobs:
           name: windows-artifacts
           path: release-assets/win
 
+      - name: Show downloaded asset paths
+        run: |
+          echo "== mac arm64 =="
+          ls -laR release-assets/mac/arm64 || true
+          echo "== windows =="
+          ls -laR release-assets/win || true
+
       - name: Create GitHub Release (upload installers)
         uses: softprops/action-gh-release@v2
         with:
@@ -161,6 +168,6 @@ jobs:
             release-assets/mac/arm64/dist-app/process_storyboard-*-mac-arm64-app.zip
             release-assets/mac/arm64/dist-app/process_storyboard-*-mac-arm64.dmg
             release-assets/mac/arm64/dist-app/process_storyboard-*-mac-arm64.pkg
-            release-assets/win/dist/process_storyboard.exe
+            release-assets/win/**/process_storyboard.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
