@@ -6,6 +6,7 @@ import subprocess
 import platform
 import pandas as pd
 import requests
+import webbrowser
 
 import argparse
 
@@ -79,6 +80,23 @@ def detect_dreamina_platform_key() -> str:
 
     if system == "darwin":
         if machine == "amd64":
+            # Apple Silicon 在 Rosetta 下运行时，platform.machine() 可能是 x86_64/amd64。
+            # 这里探测“是否在翻译层运行”以及“是否支持 arm64”，优先选择 arm64 包（若存在）。
+            try:
+                proc_translated = subprocess.run(
+                    ["sysctl", "-in", "sysctl.proc_translated"],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                arm64_capable = subprocess.run(
+                    ["sysctl", "-n", "hw.optional.arm64"],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                if proc_translated == "1" and arm64_capable == "1":
+                    return "darwin_arm64"
+            except Exception:
+                pass
             return "darwin_amd64"
         if machine == "arm64":
             return "darwin_arm64"
@@ -176,21 +194,52 @@ def ensure_dreamina_logged_in(debug_login: bool = False) -> None:
         return
 
     dreamina = get_dreamina_path()
-    login_cmd = f"\"{dreamina}\" login"
-    if debug_login:
-        login_cmd += " --debug"
+    def _print_login_result(code: int, stdout: str, stderr: str) -> None:
+        print(f"login 返回码：{code}")
+        if stdout:
+            print(stdout)
+        if stderr:
+            print(stderr)
 
     print("检测到未登录或登录态不可用，开始执行登录流程。")
-    code, stdout, stderr = run_command(login_cmd)
-    print(f"login 返回码：{code}")
-    if stdout:
-        print(stdout)
-    if stderr:
-        print(stderr)
+
+    # 某些版本的 dreamina login 不支持 --debug；因此这里做自动回退
+    attempted_debug = False
+    if debug_login:
+        attempted_debug = True
+        login_cmd = f"\"{dreamina}\" login --debug"
+        code, stdout, stderr = run_command(login_cmd)
+        _print_login_result(code, stdout, stderr)
+        if code != 0 and ("unknown flag" in (stdout or "").lower() or "unknown flag" in (stderr or "").lower()):
+            print("当前 dreamina 版本不支持 login --debug，自动回退到普通 login。")
+            debug_login = False
+
+    if not debug_login:
+        login_cmd = f"\"{dreamina}\" login"
+        opened = {"done": False}
+
+        def _maybe_open(line: str) -> None:
+            if opened["done"]:
+                return
+            key = "verification_uri:"
+            if key in line:
+                url = line.split(key, 1)[1].strip()
+                if url:
+                    opened["done"] = True
+                    print(f"检测到登录链接，尝试自动打开浏览器：{url}")
+                    try:
+                        webbrowser.open(url, new=2)
+                    except Exception:
+                        pass
+
+        code = run_command_streaming(login_cmd, on_line=_maybe_open)
+        _print_login_result(code, "", "")
 
     # 登录流程结束后再自检一次
     if not check_dreamina_logged_in():
-        raise RuntimeError("登录后自检仍失败：请检查 ~/.dreamina_cli/logs/ 日志，或尝试 dreamina login --debug")
+        if attempted_debug:
+            raise RuntimeError("登录后自检仍失败：请检查 ~/.dreamina_cli/logs/ 日志；也可尝试手动执行 dreamina login（或更新 dreamina 版本后再试）")
+        raise RuntimeError("登录后自检仍失败：请检查 ~/.dreamina_cli/logs/ 日志；也可尝试手动执行 dreamina login（或更新 dreamina 版本后再试）")
 
 
 def run_command(cmd):
@@ -232,6 +281,76 @@ def run_command(cmd):
     except Exception as e:
         return -1, "", str(e)
 
+
+def run_command_interactive(cmd: str) -> int:
+    """
+    交互式运行命令（不捕获输出），用于 login 这类需要 TTY/可能拉起浏览器的场景。
+    """
+    runtime_dir = get_runtime_dir()
+    cli_home = get_dreamina_cli_home()
+    if os.name == "nt":
+        full_cmd = f'set "DREAMINA_CLI_HOME={cli_home}" && {cmd}'
+    else:
+        full_cmd = f'DREAMINA_CLI_HOME="{cli_home}" {cmd}'
+    print(f"执行完整命令（交互式）：{full_cmd}")
+    completed = subprocess.run(full_cmd, shell=True, cwd=runtime_dir)
+    return completed.returncode
+
+
+def run_command_streaming(cmd: str, on_line=None) -> int:
+    """
+    流式运行命令：实时打印子进程输出，同时可在读取到每行时触发回调。
+    适用于 dreamina login 这类需要显示引导信息/轮询的场景。
+    """
+    runtime_dir = get_runtime_dir()
+    cli_home = get_dreamina_cli_home()
+    if os.name == "nt":
+        full_cmd = f'set "DREAMINA_CLI_HOME={cli_home}" && {cmd}'
+    else:
+        full_cmd = f'DREAMINA_CLI_HOME="{cli_home}" {cmd}'
+
+    print(f"执行完整命令（流式）：{full_cmd}")
+
+    proc = subprocess.Popen(
+        full_cmd,
+        shell=True,
+        cwd=runtime_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+
+    def _decode_line(b: bytes) -> str:
+        for enc in ("utf-8", sys.getdefaultencoding(), "gbk"):
+            try:
+                return b.decode(enc, errors="replace")
+            except Exception:
+                continue
+        return b.decode("utf-8", errors="replace")
+
+    try:
+        while True:
+            chunk = proc.stdout.readline()
+            if not chunk:
+                break
+            line = _decode_line(chunk).rstrip("\r\n")
+            if line:
+                print(line)
+                if on_line:
+                    try:
+                        on_line(line)
+                    except Exception:
+                        pass
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        returncode = proc.wait()
+
+    return returncode
+
 def query_task_status(submit_id):
     """查询任务状态"""
     # 最多尝试3次查询任务状态
@@ -258,13 +377,19 @@ def query_task_status(submit_id):
                 # 只有3次都失败后才返回 unknown 状态
                 return 'unknown', {"gen_status": "unknown", "submit_id": submit_id}
 
-def generate_video(prompt, scene=None, character_images=None, project_dir=''):
+def generate_video(prompt, scene=None, character_images=None, project_dir='', screen_size='横屏'):
     """生成视频"""
     # 构建图片参数
     image_params = []
     
+    # 根据屏幕尺寸决定宽高比
+    if screen_size == '竖屏':
+        ratio = '9:16'
+    else:
+        ratio = '16:9'
+    
     # 打印调试信息
-    print(f"调试信息：scene={scene}, character_images={character_images}, project_dir={project_dir}")
+    print(f"调试信息：scene={scene}, character_images={character_images}, project_dir={project_dir}, screen_size={screen_size}, ratio={ratio}")
     
     # 处理场景图片
     if scene:
@@ -272,7 +397,7 @@ def generate_video(prompt, scene=None, character_images=None, project_dir=''):
         if pd.isna(scene):
             print("场景为NaN，跳过")
         else:
-            scene_image = os.path.join(project_dir, "角色名", f"{scene}.png")
+            scene_image = f"{project_dir}/角色名/{scene}.png"
             print(f"检查场景图片：{scene_image}")
             if os.path.exists(scene_image):
                 image_params.append(f"--image {scene_image}")
@@ -293,7 +418,7 @@ def generate_video(prompt, scene=None, character_images=None, project_dir=''):
             print(f"解析角色：{characters}")
             for character in characters:
                 if character:
-                    character_image = os.path.join(project_dir, "角色名", f"{character}.png")
+                    character_image = f"{project_dir}/角色名/{character}.png"
                     print(f"检查角色图片：{character_image}")
                     if os.path.exists(character_image):
                         image_params.append(f"--image {character_image}")
@@ -309,12 +434,10 @@ def generate_video(prompt, scene=None, character_images=None, project_dir=''):
     # 确保至少有一个图片参数
     if not image_args:
         # 如果没有图片，使用text2video命令
-        dreamina = get_dreamina_path()
-        cmd = f'"{dreamina}" text2video --prompt="{prompt}" --ratio=16:9 --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
+        cmd = f'./dreamina text2video --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
         print(f"没有图片输入，使用text2video命令：{cmd}")
     else:
-        dreamina = get_dreamina_path()
-        cmd = f'"{dreamina}" multimodal2video {image_args} --prompt="{prompt}" --ratio=16:9 --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
+        cmd = f'./dreamina multimodal2video {image_args} --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
         print(f"执行命令：{cmd}")
     
     # 执行命令
@@ -684,8 +807,14 @@ def main(project_dir, debug_login: bool = False):
             prompt = scene_str + character_str + original_prompt
             print(f"----------------------------------------------------------------")
             print(f"生成视频：编号 {row.get('编号', 'N/A')}")
+
+            # 获取屏幕尺寸
+            screen_size = row.get('屏幕尺寸', '横屏')
+            if pd.isna(screen_size):
+                screen_size = '横屏'
+
             # 生成视频
-            submit_id, error = generate_video(prompt, scene, character_images, project_dir)
+            submit_id, error = generate_video(prompt, scene, character_images, project_dir, screen_size)
             if submit_id:
                 # 检查是否直接返回了失败状态
                 if isinstance(error, tuple) and error[0] == 'fail':
