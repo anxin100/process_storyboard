@@ -1,0 +1,131 @@
+name: Build installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: PyInstaller (.app)
+        run: pyinstaller --noconfirm process_storyboard.spec
+
+      - name: Create DMG (UDZO)
+        run: |
+          RAW_VER="${GITHUB_REF_NAME:-0.0.0}"
+          VERSION="${RAW_VER#v}"
+          APP_PATH="dist/process_storyboard.app"
+          DMG_PATH="dist/process_storyboard-${VERSION}.dmg"
+          test -d "$APP_PATH"
+          hdiutil create -volname "process_storyboard" -srcfolder "$APP_PATH" -format UDZO -imagekey zlib-level=9 -ov "$DMG_PATH"
+
+      - name: Create PKG (flat)
+        run: |
+          RAW_VER="${GITHUB_REF_NAME:-0.0.0}"
+          VERSION="${RAW_VER#v}"
+          IDENTIFIER="com.anxin.process_storyboard.pkg"
+          PKG_PATH="dist/process_storyboard-${VERSION}.pkg"
+          APP_PATH="dist/process_storyboard.app"
+          test -d "$APP_PATH"
+          rm -rf build/pkgroot
+          mkdir -p build/pkgroot/Applications
+          cp -R "$APP_PATH" "build/pkgroot/Applications/"
+          pkgbuild --root build/pkgroot --identifier "$IDENTIFIER" --version "$VERSION" "$PKG_PATH"
+
+      - name: Zip .app (for GitHub Releases)
+        run: |
+          RAW_VER="${GITHUB_REF_NAME:-0.0.0}"
+          VERSION="${RAW_VER#v}"
+          APP_PATH="dist/process_storyboard.app"
+          ZIP_PATH="dist/process_storyboard-${VERSION}-mac-app.zip"
+          test -d "$APP_PATH"
+          ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
+
+      - name: Upload artifacts (mac)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-artifacts
+          path: |
+            dist/process_storyboard.app
+            dist/process_storyboard-*-mac-app.zip
+            dist/process_storyboard-*.dmg
+            dist/process_storyboard-*.pkg
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: PyInstaller (.exe)
+        shell: pwsh
+        run: pyinstaller --noconfirm process_storyboard.spec
+
+      - name: Upload artifacts (windows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: |
+            dist/process_storyboard.exe
+
+  release:
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - name: Download mac artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-artifacts
+          path: release-assets/mac
+
+      - name: Download windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-artifacts
+          path: release-assets/win
+
+      - name: Create GitHub Release (upload installers)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/mac/process_storyboard-*-mac-app.zip
+            release-assets/mac/process_storyboard-*.dmg
+            release-assets/mac/process_storyboard-*.pkg
+            release-assets/win/process_storyboard.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

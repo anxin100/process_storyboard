@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.venv/
+venv/
+ENV/
+.DS_Store
+
+# PyInstaller
+build/
+dist/
+
+# Local runtime data
+.dreamina_cli/
+process_storyboard/output_videos/
+
