@@ -157,10 +157,10 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            release-assets/mac/arm64/process_storyboard-*-mac-arm64-cli.zip
-            release-assets/mac/arm64/process_storyboard-*-mac-arm64-app.zip
-            release-assets/mac/arm64/process_storyboard-*-mac-arm64.dmg
-            release-assets/mac/arm64/process_storyboard-*-mac-arm64.pkg
-            release-assets/win/process_storyboard.exe
+            release-assets/mac/arm64/dist-cli/process_storyboard-*-mac-arm64-cli.zip
+            release-assets/mac/arm64/dist-app/process_storyboard-*-mac-arm64-app.zip
+            release-assets/mac/arm64/dist-app/process_storyboard-*-mac-arm64.dmg
+            release-assets/mac/arm64/dist-app/process_storyboard-*-mac-arm64.pkg
+            release-assets/win/dist/process_storyboard.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
