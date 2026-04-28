@@ -205,14 +205,30 @@ def run_command(cmd):
         else:
             full_cmd = f'DREAMINA_CLI_HOME="{cli_home}" {cmd}'
         print(f"执行完整命令：{full_cmd}")
+        # 统一以 bytes 捕获输出，再手动解码，避免 Windows 下 _readerthread 因默认 GBK 解码崩溃
         result = subprocess.run(
             full_cmd, 
             shell=True, 
             capture_output=True, 
-            text=True, 
-            cwd=runtime_dir
+            cwd=runtime_dir,
         )
-        return result.returncode, result.stdout, result.stderr
+
+        def _decode(b) -> str:
+            if b is None:
+                return ""
+            if isinstance(b, str):
+                return b
+            # 优先 utf-8，其次系统首选编码；都不行就替换
+            for enc in ("utf-8", sys.getdefaultencoding(), "gbk"):
+                try:
+                    return b.decode(enc, errors="replace")
+                except Exception:
+                    continue
+            return b.decode("utf-8", errors="replace")
+
+        stdout = _decode(result.stdout)
+        stderr = _decode(result.stderr)
+        return result.returncode, stdout, stderr
     except Exception as e:
         return -1, "", str(e)
 
