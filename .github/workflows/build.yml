@@ -15,7 +15,17 @@ concurrency:
 
 jobs:
   mac:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            arch: amd64
+            dreamina_platform_key: darwin_amd64
+          - runner: macos-14
+            arch: arm64
+            dreamina_platform_key: darwin_arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -28,15 +38,38 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: PyInstaller (.app)
-        run: pyinstaller --noconfirm process_storyboard.spec
+      - name: Set dreamina platform key
+        run: echo "DREAMINA_PLATFORM_KEY=${{ matrix.dreamina_platform_key }}" >> "$GITHUB_ENV"
+
+      - name: PyInstaller (mac CLI onefile)
+        run: |
+          rm -rf dist-cli build-cli
+          pyinstaller --noconfirm --clean \
+            --distpath dist-cli --workpath build-cli \
+            process_storyboard_cli.spec
+
+      - name: Zip mac CLI (for Releases)
+        run: |
+          RAW_VER="${GITHUB_REF_NAME:-0.0.0}"
+          VERSION="${RAW_VER#v}"
+          CLI_PATH="dist-cli/process_storyboard"
+          ZIP_PATH="dist-cli/process_storyboard-${VERSION}-mac-${{ matrix.arch }}-cli.zip"
+          test -f "$CLI_PATH"
+          ditto -c -k --keepParent "$CLI_PATH" "$ZIP_PATH"
+
+      - name: PyInstaller (mac .app)
+        run: |
+          rm -rf dist-app build-app
+          pyinstaller --noconfirm --clean \
+            --distpath dist-app --workpath build-app \
+            process_storyboard_app.spec
 
       - name: Create DMG (UDZO)
         run: |
           RAW_VER="${GITHUB_REF_NAME:-0.0.0}"
           VERSION="${RAW_VER#v}"
-          APP_PATH="dist/process_storyboard.app"
-          DMG_PATH="dist/process_storyboard-${VERSION}.dmg"
+          APP_PATH="dist-app/process_storyboard.app"
+          DMG_PATH="dist-app/process_storyboard-${VERSION}-mac-${{ matrix.arch }}.dmg"
           test -d "$APP_PATH"
           hdiutil create -volname "process_storyboard" -srcfolder "$APP_PATH" -format UDZO -imagekey zlib-level=9 -ov "$DMG_PATH"
 
@@ -45,8 +78,8 @@ jobs:
           RAW_VER="${GITHUB_REF_NAME:-0.0.0}"
           VERSION="${RAW_VER#v}"
           IDENTIFIER="com.anxin.process_storyboard.pkg"
-          PKG_PATH="dist/process_storyboard-${VERSION}.pkg"
-          APP_PATH="dist/process_storyboard.app"
+          PKG_PATH="dist-app/process_storyboard-${VERSION}-mac-${{ matrix.arch }}.pkg"
+          APP_PATH="dist-app/process_storyboard.app"
           test -d "$APP_PATH"
           rm -rf build/pkgroot
           mkdir -p build/pkgroot/Applications
@@ -57,20 +90,22 @@ jobs:
         run: |
           RAW_VER="${GITHUB_REF_NAME:-0.0.0}"
           VERSION="${RAW_VER#v}"
-          APP_PATH="dist/process_storyboard.app"
-          ZIP_PATH="dist/process_storyboard-${VERSION}-mac-app.zip"
+          APP_PATH="dist-app/process_storyboard.app"
+          ZIP_PATH="dist-app/process_storyboard-${VERSION}-mac-${{ matrix.arch }}-app.zip"
           test -d "$APP_PATH"
           ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
 
       - name: Upload artifacts (mac)
         uses: actions/upload-artifact@v4
         with:
-          name: mac-artifacts
+          name: mac-artifacts-${{ matrix.arch }}
           path: |
-            dist/process_storyboard.app
-            dist/process_storyboard-*-mac-app.zip
-            dist/process_storyboard-*.dmg
-            dist/process_storyboard-*.pkg
+            dist-cli/process_storyboard
+            dist-cli/process_storyboard-*-mac-${{ matrix.arch }}-cli.zip
+            dist-app/process_storyboard.app
+            dist-app/process_storyboard-*-mac-${{ matrix.arch }}-app.zip
+            dist-app/process_storyboard-*-mac-${{ matrix.arch }}.dmg
+            dist-app/process_storyboard-*-mac-${{ matrix.arch }}.pkg
 
   windows:
     runs-on: windows-latest
@@ -89,7 +124,9 @@ jobs:
 
       - name: PyInstaller (.exe)
         shell: pwsh
-        run: pyinstaller --noconfirm process_storyboard.spec
+        run: |
+          $env:DREAMINA_PLATFORM_KEY = "windows_amd64"
+          pyinstaller --noconfirm --clean process_storyboard_cli.spec
 
       - name: Upload artifacts (windows)
         uses: actions/upload-artifact@v4
@@ -103,11 +140,17 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     steps:
-      - name: Download mac artifacts
+      - name: Download mac artifacts (amd64)
         uses: actions/download-artifact@v4
         with:
-          name: mac-artifacts
-          path: release-assets/mac
+          name: mac-artifacts-amd64
+          path: release-assets/mac/amd64
+
+      - name: Download mac artifacts (arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-artifacts-arm64
+          path: release-assets/mac/arm64
 
       - name: Download windows artifacts
         uses: actions/download-artifact@v4
@@ -123,9 +166,14 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            release-assets/mac/process_storyboard-*-mac-app.zip
-            release-assets/mac/process_storyboard-*.dmg
-            release-assets/mac/process_storyboard-*.pkg
+            release-assets/mac/amd64/process_storyboard-*-mac-amd64-cli.zip
+            release-assets/mac/amd64/process_storyboard-*-mac-amd64-app.zip
+            release-assets/mac/amd64/process_storyboard-*-mac-amd64.dmg
+            release-assets/mac/amd64/process_storyboard-*-mac-amd64.pkg
+            release-assets/mac/arm64/process_storyboard-*-mac-arm64-cli.zip
+            release-assets/mac/arm64/process_storyboard-*-mac-arm64-app.zip
+            release-assets/mac/arm64/process_storyboard-*-mac-arm64.dmg
+            release-assets/mac/arm64/process_storyboard-*-mac-arm64.pkg
             release-assets/win/process_storyboard.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

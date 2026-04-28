@@ -21,17 +21,37 @@ def get_runtime_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def get_app_container_dir() -> str:
+    """
+    获取“用户看到的应用所在目录”，用于双击 .app 时解析相对路径：
+    - macOS PyInstaller .app：.../Foo.app/Contents/MacOS/Foo -> 返回 Foo.app 的上一级目录
+      (通常是 ~/Downloads 或 /Applications)
+    - 其他情况：返回当前工作目录
+    """
+    try:
+        if getattr(sys, "frozen", False) and sys.platform == "darwin":
+            exe_path = os.path.realpath(sys.executable)
+            # Foo.app/Contents/MacOS/Foo -> parents[3] 为 Foo.app 的上一级目录
+            return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(exe_path))))
+    except Exception:
+        pass
+    return os.getcwd()
+
+
 def resolve_project_dir(project_dir: str) -> str:
     """
     解析用户传入的项目目录：
     - 绝对路径：原样使用
-    - 相对路径：相对当前工作目录（便于用户双击/命令行运行）
+    - 相对路径：
+      - 打包后（尤其双击 .app）：相对 .app 所在目录（更符合用户直觉）
+      - 源码运行：相对当前工作目录
     """
     if not project_dir:
         return ""
     if os.path.isabs(project_dir):
         return os.path.normpath(project_dir)
-    return os.path.normpath(os.path.join(os.getcwd(), project_dir))
+    base_dir = get_app_container_dir() if getattr(sys, "frozen", False) else os.getcwd()
+    return os.path.normpath(os.path.join(base_dir, project_dir))
 
 
 def get_project_name(project_dir: str) -> str:
@@ -107,6 +127,71 @@ def get_default_project_dir_name() -> str:
     prog = os.path.basename(sys.argv[0]) or "project"
     name, _ext = os.path.splitext(prog)
     return name or "project"
+
+
+def parse_json_maybe(text: str):
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def check_dreamina_logged_in() -> bool:
+    """
+    使用 dreamina user_credit 作为登录自检。
+    文档建议：能返回包含余额信息的 JSON 即认为登录态可用。
+    """
+    dreamina = get_dreamina_path()
+    if not os.path.exists(dreamina):
+        print(f"未找到 dreamina 可执行文件：{dreamina}")
+        return False
+
+    cmd = f"\"{dreamina}\" user_credit"
+    code, stdout, stderr = run_command(cmd)
+    if code != 0:
+        print(f"user_credit 失败（code={code}）：{stderr}")
+        return False
+
+    data = parse_json_maybe(stdout)
+    if not isinstance(data, dict):
+        print(f"user_credit 输出不是JSON：{stdout}")
+        return False
+
+    # 不严格限定字段名，只要是 dict 且非空即可
+    if not data:
+        print("user_credit 返回空JSON，视为未登录/不可用")
+        return False
+
+    return True
+
+
+def ensure_dreamina_logged_in(debug_login: bool = False) -> None:
+    """
+    启动时确保用户已登录：
+    - 未登录：执行 dreamina login（可选 --debug）
+    - 登录完成后：再次 user_credit 自检，不通过则直接退出
+    """
+    if check_dreamina_logged_in():
+        print("Dreamina 登录态正常。")
+        return
+
+    dreamina = get_dreamina_path()
+    login_cmd = f"\"{dreamina}\" login"
+    if debug_login:
+        login_cmd += " --debug"
+
+    print("检测到未登录或登录态不可用，开始执行登录流程。")
+    code, stdout, stderr = run_command(login_cmd)
+    print(f"login 返回码：{code}")
+    if stdout:
+        print(stdout)
+    if stderr:
+        print(stderr)
+
+    # 登录流程结束后再自检一次
+    if not check_dreamina_logged_in():
+        raise RuntimeError("登录后自检仍失败：请检查 ~/.dreamina_cli/logs/ 日志，或尝试 dreamina login --debug")
+
 
 def run_command(cmd):
     """运行命令并返回结果"""
@@ -385,11 +470,22 @@ def download_video(submit_id, output_path, data=None):
             os.remove(output_path)
         return False
 
-def main(project_dir):
+def main(project_dir, debug_login: bool = False):
     project_dir = resolve_project_dir(project_dir)
     if not project_dir:
         print("project_dir 为空，请使用 --project-dir 指定项目目录")
         return
+
+    # 默认项目目录不存在则自动创建，便于用户首次使用
+    if not os.path.exists(project_dir):
+        os.makedirs(project_dir, exist_ok=True)
+        # 预创建常用子目录
+        os.makedirs(os.path.join(project_dir, "角色名"), exist_ok=True)
+        os.makedirs(os.path.join(project_dir, "output_videos"), exist_ok=True)
+        print(f"已创建默认项目目录：{project_dir}")
+
+    # 启动先确保登录态可用（否则后续 query/text2video 会失败）
+    ensure_dreamina_logged_in(debug_login=debug_login)
 
     project_name = get_project_name(project_dir)
 
@@ -397,6 +493,7 @@ def main(project_dir):
     excel_path = os.path.join(project_dir, f"{project_name}分镜.xlsx")
     if not os.path.exists(excel_path):
         print(f"文件 {excel_path} 不存在")
+        print("请将分镜Excel放入项目目录后重试。")
         return
     
     # 创建输出目录
@@ -694,6 +791,11 @@ if __name__ == "__main__":
         default=get_default_project_dir_name(),
         help="项目目录路径（默认=程序同名目录；目录内需包含：<项目名>分镜.xlsx、角色名/ 等）",
     )
+    parser.add_argument(
+        "--debug-login",
+        action="store_true",
+        help="若需要登录，则执行 dreamina login --debug（用于排查登录卡住/浏览器未拉起等问题）",
+    )
     args = parser.parse_args()
-    main(args.project_dir)
+    main(args.project_dir, debug_login=args.debug_login)
 

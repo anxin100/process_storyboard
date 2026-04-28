@@ -87,12 +87,16 @@ python process_storyboard.py --project-dir "/abs/path/process_storyboard"
 
 - **产物下载**
   - Actions 运行完成后，在对应 Run 页面下载 **Artifacts**
-    - `mac-artifacts`：`process_storyboard.app`、`.zip`（`.app` 打 zip，便于上传 Release）、`.dmg`、`.pkg`
+    - `mac-artifacts`：
+      - **CLI 版**：`process_storyboard`（可执行文件）与 `process_storyboard-<version>-mac-cli.zip`
+      - **安装包版**：`process_storyboard.app`、`process_storyboard-<version>-mac-app.zip`、`.dmg`、`.pkg`
     - `windows-artifacts`：`process_storyboard.exe`
 
 - **Release（GitHub Releases 附件）**
   - 当你 **推送 `v*` tag** 并且构建成功后，会自动创建/更新对应 tag 的 **GitHub Release**，并上传：
-    - macOS：`process_storyboard-<version>-mac-app.zip`、`process_storyboard-<version>.dmg`、`process_storyboard-<version>.pkg`
+    - macOS：
+      - **CLI 版**：`process_storyboard-<version>-mac-cli.zip`
+      - **安装包版**：`process_storyboard-<version>-mac-app.zip`、`process_storyboard-<version>.dmg`、`process_storyboard-<version>.pkg`
     - Windows：`process_storyboard.exe`
   - **手动触发 workflow（workflow_dispatch）不会创建 Release**（因为没有 tag 上下文）；它仍会产出 Artifacts 方便调试。
 
