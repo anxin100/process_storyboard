@@ -62,6 +62,9 @@ def parse_rfc3339(s: str) -> datetime:
         s = s[:-1] + "+00:00"
     return datetime.fromisoformat(s)
 
+def now_rfc3339_z() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
 
 def compute_machine_raw_id() -> str:
     """
@@ -616,7 +619,7 @@ def query_task_status(submit_id):
                 # 只有3次都失败后才返回 unknown 状态
                 return 'unknown', {"gen_status": "unknown", "submit_id": submit_id}
 
-def generate_video(prompt, scene=None, character_images=None, project_dir='', screen_size='横屏'):
+def generate_video(prompt, scene=None, character_images=None, project_dir='', screen_size='横屏', model_version: str = "seedance2.0fast"):
     """生成视频"""
     # 构建图片参数
     image_params = []
@@ -628,7 +631,7 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
         ratio = '16:9'
     
     # 打印调试信息
-    print(f"调试信息：scene={scene}, character_images={character_images}, project_dir={project_dir}, screen_size={screen_size}, ratio={ratio}")
+    print(f"调试信息：scene={scene}, character_images={character_images}, project_dir={project_dir}, screen_size={screen_size}, ratio={ratio}, model_version={model_version}")
 
     # 注意：prompt 允许包含换行；调用 dreamina 时需用 argv 方式传参，避免 shell 把换行当作命令分隔符
     
@@ -679,7 +682,7 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
             f"--ratio={ratio}",
             "--duration=15",
             "--video_resolution=720P",
-            "--model_version=seedance2.0fast",
+            f"--model_version={model_version}",
             # 放到最后：避免 prompt 内换行导致后续参数“被吞”
             "--prompt",
             prompt,
@@ -692,7 +695,7 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
             f"--ratio={ratio}",
             "--duration=15",
             "--video_resolution=720P",
-            "--model_version=seedance2.0fast",
+            f"--model_version={model_version}",
         ]
         # image_params 目前是 '--image <path>' 字符串，拆成两个参数
         for p in image_params:
@@ -876,7 +879,7 @@ def download_video(submit_id, output_path, data=None):
             os.remove(output_path)
         return False
 
-def main(project_dir, debug_login: bool = False):
+def main(project_dir, debug_login: bool = False, models=None):
     project_dir = resolve_project_dir(project_dir)
     if not project_dir:
         print("project_dir 为空，请使用 --project-dir 指定项目目录")
@@ -920,283 +923,206 @@ def main(project_dir, debug_login: bool = False):
         df['视频位置'] = df['视频位置'].astype(str).replace('nan', '')
     if '视频是否保存' in df.columns:
         df['视频是否保存'] = df['视频是否保存'].astype(str).replace('nan', '')
+    if '提交时间' in df.columns:
+        df['提交时间'] = df['提交时间'].astype(str).replace('nan', '')
     
     # 按编号排序
     if '编号' in df.columns:
         df = df.sort_values('编号')
     
-    for index, row in df.iterrows():
-        print(f"----------------------------------------------------------------")
-        # 检查视频是否保存
-        video_saved = row.get('视频是否保存', '')
-        # 处理NaN值和字符串比较
-        if not pd.isna(video_saved) and str(video_saved).strip() == '是':
-            print(f"跳过编号 {row.get('编号', 'N/A')}：视频已保存")
-            continue
-        
-        # 检查任务ID
-        task_id = row.get('任务ID', '')
-        # 处理NaN值
-        if pd.isna(task_id):
-            task_id = ''
-        
-        if task_id:
+    retry_keywords = [
+        'ExceedConcurrencyLimit',
+        'pre-TNS check did not pass',
+        'post-TNS check did not pass',
+        'final generation failed',
+        'upload resource',
+        'upload image'
+    ]
+
+    def is_done_row(r) -> bool:
+        video_saved = r.get('视频是否保存', '')
+        if (not pd.isna(video_saved)) and str(video_saved).strip() == '是':
+            return True
+        # 超时视为结束（不再轮询）
+        status = r.get('状态', '')
+        if not pd.isna(status) and str(status).strip() == '超时':
+            return True
+        return False
+
+    model_list = [m.strip() for m in (models or []) if str(m).strip()]
+    if not model_list:
+        model_list = ["seedance2.0fast"]
+
+    # 主循环：每隔 60 秒轮询一次所有未结束任务
+    while True:
+        any_inflight = False
+
+        # 1) 轮询所有未结束的任务ID（不再卡住单个 ID）
+        for index, row in df.iterrows():
+            if is_done_row(row):
+                continue
+
+            task_id = row.get('任务ID', '')
+            if pd.isna(task_id):
+                task_id = ''
+            task_id = str(task_id).replace('nan', '').strip()
+            if not task_id:
+                continue
+
             print(f"处理编号 {row.get('编号', 'N/A')}：任务ID = {task_id}")
-            
-            # 查询任务状态
             status, data = query_task_status(task_id)
             if status is None:
                 print(f"查询任务状态失败：{data}")
                 continue
-            
+
+            if status in ['queued', 'generating', 'querying']:
+                # 超时判定：超过 5 小时仍未结束则标记为超时并停止轮询
+                submitted_at = row.get('提交时间', '')
+                if pd.isna(submitted_at):
+                    submitted_at = ''
+                submitted_at = str(submitted_at).strip()
+                if not submitted_at:
+                    submitted_at = now_rfc3339_z()
+                    df.at[index, '提交时间'] = submitted_at
+                try:
+                    start = parse_rfc3339(submitted_at).astimezone(timezone.utc)
+                    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+                    if elapsed > 5 * 3600:
+                        df.at[index, '状态'] = '超时'
+                        print(f"任务超时：已超过5小时（编号 {row.get('编号', 'N/A')}，任务ID={task_id}）")
+                        continue
+                except Exception:
+                    # 提交时间解析失败则重置
+                    df.at[index, '提交时间'] = now_rfc3339_z()
+                any_inflight = True
+                continue
+
             if status == 'success':
-                # 下载视频
                 output_file = os.path.join(output_dir, f"{row.get('编号', 'N/A')}_{task_id}.mp4")
                 if download_video_http(task_id, output_file, data):
-                    # 更新Excel
                     df.at[index, '视频位置'] = output_file
                     df.at[index, '状态'] = '成功'
                     df.at[index, '视频是否保存'] = '是'
                     print(f"视频下载成功：{output_file}")
                 else:
-                    print(f"视频下载失败")
-            elif status in ['queued', 'generating', 'querying']:
-                # 持续等待直到任务完成或失败
-                max_wait_time = 3600*5  # 最大等待时间，1小时
-                start_time = time.time()
-                while status in ['queued', 'generating', 'querying']:
-                    elapsed_time = time.time() - start_time
-                    if elapsed_time > max_wait_time:
-                        print(f"任务等待超时，已等待 {max_wait_time} 秒")
-                        break
-                    
-                    print(f"任务状态：{status}，等待60秒")
-                    time.sleep(60)
-                    # 重新查询
-                    status, data = query_task_status(task_id)
-                
-                if status == 'success':
-                    output_file = os.path.join(output_dir, f"{row.get('编号', 'N/A')}_{task_id}.mp4")
-                    if download_video_http(task_id, output_file, data):
-                        df.at[index, '视频位置'] = output_file
-                        df.at[index, '状态'] = '成功'
-                        df.at[index, '视频是否保存'] = '是'
-                        print(f"视频下载成功：{output_file}")
-                    else:
-                        print(f"视频下载失败")
-                elif status == 'fail':
-                    # 处理失败状态
-                    fail_reason = data.get('fail_reason', '未知失败原因')
-                    print(f"任务失败：{fail_reason}")
-                    # 需要重新生成的失败原因关键词
-                    retry_keywords = [
-                        'ExceedConcurrencyLimit',
-                        'pre-TNS check did not pass',
-                        'post-TNS check did not pass',
-                        'final generation failed',
-                        'upload resource',
-                        'upload image'
-                    ]
-                    # 检查是否需要重新生成
-                    need_retry = any(keyword in fail_reason for keyword in retry_keywords)
-                    if need_retry:
-                        print(f"失败原因：{fail_reason}，清空任务ID并重新执行")
-                        df.at[index, '任务ID'] = ''
-                        df.at[index, '状态'] = ''
-                        # 继续处理，生成新视频
-                    else:
-                        # 其他失败原因，更新状态为失败
-                        df.at[index, '状态'] = '失败'
-                else:
-                    print(f"任务状态：{status}，无法完成")
-            elif status in ['rejected', 'cancelled']:
-                # 清空任务ID，重新执行
+                    print("视频下载失败")
+                continue
+
+            if status in ['rejected', 'cancelled']:
                 print(f"任务状态：{status}，清空任务ID")
                 df.at[index, '任务ID'] = ''
                 df.at[index, '状态'] = ''
-                # 继续处理，生成新视频
-            elif status == 'fail':
-                # 处理失败状态
-                fail_reason = data.get('fail_reason', '未知失败原因')
+                continue
+
+            if status == 'fail':
+                fail_reason = (data or {}).get('fail_reason', '未知失败原因')
                 print(f"任务失败：{fail_reason}")
-                # 需要重新生成的失败原因关键词
-                retry_keywords = [
-                    'ExceedConcurrencyLimit',
-                    'pre-TNS check did not pass',
-                    'post-TNS check did not pass',
-                    'final generation failed',
-                    'upload resource',
-                    'upload image'
-                ]
-                # 检查是否需要重新生成
                 need_retry = any(keyword in fail_reason for keyword in retry_keywords)
                 if need_retry:
                     print(f"失败原因：{fail_reason}，清空任务ID并重新执行")
                     df.at[index, '任务ID'] = ''
                     df.at[index, '状态'] = ''
-                    # 继续处理，生成新视频
                 else:
-                    # 其他失败原因，更新状态为失败
                     df.at[index, '状态'] = '失败'
-            else:
-                print(f"未知任务状态：{status}")
-        
-        # 如果任务ID为空，生成视频
-        if not task_id:
-            # 获取原始视频提示词
-            original_prompt = row.get('视频提示词', '')
-            if not original_prompt:
-                print(f"跳过编号 {row.get('编号', 'N/A')}：无视频提示词")
                 continue
-            
-            # 构建场景字符串
-            scene = row.get('场景', '')
-            # 处理NaN值
-            if pd.isna(scene):
-                scene = ''
-            scene_str = f"场景=@{scene}.png。" if scene else ""
-            
-            # 构建角色字符串
-            character_images = row.get('角色图', '')
-            # 处理NaN值
-            if pd.isna(character_images):
-                character_images = ''
-            character_str = ""
-            if character_images:
-                # 同时支持中文逗号和英文逗号
-                import re
-                characters = re.split('[，,]', character_images)
-                # 过滤空字符
-                characters = [c.strip() for c in characters if c.strip()]
-                if characters:
-                    character_parts = [f"{c}=@{c}.png" for c in characters]
-                    character_str = "，".join(character_parts) + "。"
-            
-            # 构建最终提示词
-            prompt = scene_str + character_str + original_prompt
-            print(f"----------------------------------------------------------------")
-            print(f"生成视频：编号 {row.get('编号', 'N/A')}")
 
-            # 获取屏幕尺寸
-            screen_size = row.get('屏幕尺寸', '横屏')
-            if pd.isna(screen_size):
-                screen_size = '横屏'
+            print(f"未知任务状态：{status}")
 
-            # 生成视频
-            submit_id, error = generate_video(prompt, scene, character_images, project_dir, screen_size)
-            if submit_id:
-                # 检查是否直接返回了失败状态
-                if isinstance(error, tuple) and error[0] == 'fail':
-                    status, fail_reason = error
-                    print(f"任务提交失败：{fail_reason}")
-                    # 需要重新生成的失败原因关键词
-                    retry_keywords = [
-                        'ExceedConcurrencyLimit',
-                        'pre-TNS check did not pass',
-                        'post-TNS check did not pass',
-                        'final generation failed',
-                        'upload resource',
-                        'upload image'
-                    ]
-                    # 检查是否需要重新生成
-                    need_retry = any(keyword in fail_reason for keyword in retry_keywords)
-                    if need_retry:
-                        print(f"失败原因：{fail_reason}，等待60秒后重新执行")
-                        # 等待60秒
-                        time.sleep(60)
-                        # 清空任务ID
-                        df.at[index, '任务ID'] = ''
-                        df.at[index, '状态'] = ''
-                        # 重新处理当前行
-                        continue
-                    else:
-                        # 其他失败原因，更新状态为失败
-                        df.at[index, '状态'] = '失败'
-                else:
-                    df.at[index, '任务ID'] = submit_id
-                    df.at[index, '状态'] = '生成中'
-                    print(f"生成任务已提交：{submit_id}")
-                    
-                    # 等待60秒
-                    time.sleep(60)
-                    
-                    # 查询状态
-                    status, data = query_task_status(submit_id)
-                    # 持续等待直到任务完成或失败
-                    if status in ['queued', 'generating', 'querying']:
-                        max_wait_time = 3600*5  # 最大等待时间，1小时
-                        start_time = time.time()
-                        while status in ['queued', 'generating', 'querying']:
-                            elapsed_time = time.time() - start_time
-                            if elapsed_time > max_wait_time:
-                                print(f"任务等待超时，已等待 {max_wait_time} 秒")
-                                break
-                            
-                            print(f"任务状态：{status}，等待60秒")
-                            time.sleep(60)
-                            # 重新查询
-                            status, data = query_task_status(submit_id)
-                    
-                    if status == 'success':
-                        output_file = os.path.join(output_dir, f"{row.get('编号', 'N/A')}_{submit_id}.mp4")
-                        if download_video_http(submit_id, output_file, data):
-                            df.at[index, '视频位置'] = output_file
-                            df.at[index, '状态'] = '成功'
-                            df.at[index, '视频是否保存'] = '是'
-                            print(f"视频下载成功：{output_file}")
-                        else:
-                            print(f"视频下载失败")
-                    elif status == 'fail':
-                        # 处理失败状态
-                        fail_reason = data.get('fail_reason', '未知失败原因')
-                        print(f"任务失败：{fail_reason}")
-                        # 需要重新生成的失败原因关键词
-                        retry_keywords = [
-                            'ExceedConcurrencyLimit',
-                            'pre-TNS check did not pass',
-                            'post-TNS check did not pass',
-                            'final generation failed',
-                            'upload resource',
-                            'upload image'
-                        ]
-                        # 检查是否需要重新生成
+        # 2) 提交阶段：只有在“没有任何在途任务”时才提交；一次按模型数量提交 N 条
+        if not any_inflight:
+            to_submit = []  # list[(index, row)]
+            for index, row in df.iterrows():
+                if len(to_submit) >= len(model_list):
+                    break
+                if is_done_row(row):
+                    continue
+                task_id = row.get('任务ID', '')
+                if pd.isna(task_id):
+                    task_id = ''
+                task_id = str(task_id).replace('nan', '').strip()
+                if task_id:
+                    continue
+                original_prompt = row.get('视频提示词', '')
+                if not original_prompt:
+                    continue
+                to_submit.append((index, row))
+
+            for i, (index, row) in enumerate(to_submit):
+                mv = model_list[i % len(model_list)]
+                original_prompt = row.get('视频提示词', '')
+                if not original_prompt:
+                    print(f"跳过编号 {row.get('编号', 'N/A')}：无视频提示词")
+                    continue
+
+                scene = row.get('场景', '')
+                if pd.isna(scene):
+                    scene = ''
+                scene_str = f"场景=@{scene}.png。" if scene else ""
+
+                character_images = row.get('角色图', '')
+                if pd.isna(character_images):
+                    character_images = ''
+                character_str = ""
+                if character_images:
+                    import re
+                    characters = re.split('[，,]', character_images)
+                    characters = [c.strip() for c in characters if c.strip()]
+                    if characters:
+                        character_parts = [f"{c}=@{c}.png" for c in characters]
+                        character_str = "，".join(character_parts) + "。"
+
+                prompt = scene_str + character_str + original_prompt
+                print(f"----------------------------------------------------------------")
+                print(f"生成视频：编号 {row.get('编号', 'N/A')}（模型 {mv}）")
+
+                screen_size = row.get('屏幕尺寸', '横屏')
+                if pd.isna(screen_size):
+                    screen_size = '横屏'
+
+                submit_id, error = generate_video(prompt, scene, character_images, project_dir, screen_size, model_version=mv)
+                if submit_id:
+                    if isinstance(error, tuple) and error[0] == 'fail':
+                        _status, fail_reason = error
+                        print(f"任务提交失败：{fail_reason}")
                         need_retry = any(keyword in fail_reason for keyword in retry_keywords)
                         if need_retry:
-                            print(f"失败原因：{fail_reason}，清空任务ID并重新执行")
-                            df.at[index, '任务ID'] = ''
-                            df.at[index, '状态'] = ''
-                            # 继续处理，生成新视频
+                            print("等待60秒后重新尝试提交")
+                            any_inflight = True
                         else:
-                            # 其他失败原因，更新状态为失败
                             df.at[index, '状态'] = '失败'
                     else:
-                        print(f"任务状态：{status}")
-            else:
-                print(f"生成视频失败：{error}")
-        
-        # 保存Excel文件
+                        df.at[index, '任务ID'] = submit_id
+                        df.at[index, '状态'] = '生成中'
+                        df.at[index, '提交时间'] = now_rfc3339_z()
+                        print(f"生成任务已提交：{submit_id}")
+                        any_inflight = True
+                else:
+                    print(f"生成视频失败：{error}")
+                    df.at[index, '状态'] = '失败'
+
+        # 3) 保存 Excel
         df.to_excel(excel_path, index=False)
         print("Excel文件已更新")
-        
-        # 检查是否还有下一个任务
-        if index < len(df) - 1:
-            # 间隔60秒
-            print("等待5秒后处理下一个任务")
-            time.sleep(5)
-        else:
-            # 已经是最后一个任务，检查是否有失败的任务
-            if '状态' in df.columns:
-                failed_tasks = df[df['状态'] == '失败']
-                if len(failed_tasks) > 0:
-                    print(f"发现 {len(failed_tasks)} 个失败的任务，重新从Excel开头开始执行")
-                    # 重新执行主函数
-                    main()
-                else:
-                    # 没有失败的任务，退出脚本
-                    print("所有任务处理完成，退出脚本")
-            else:
-                # 没有状态列，退出脚本
-                print("所有任务处理完成，退出脚本")
+
+        # 4) 退出条件：没有在途任务 + 没有可提交的新任务
+        has_unsubmitted = False
+        for _idx, _row in df.iterrows():
+            if is_done_row(_row):
+                continue
+            _task_id = _row.get('任务ID', '')
+            if pd.isna(_task_id):
+                _task_id = ''
+            if not str(_task_id).replace('nan', '').strip():
+                # 仍有未提交的行
+                has_unsubmitted = True
+                break
+
+        if (not any_inflight) and (not has_unsubmitted):
+            print("所有任务处理完成，退出脚本")
+            return
+
+        print("等待60秒后轮询所有未结束任务")
+        time.sleep(60)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="根据分镜Excel批量生成/下载视频")
@@ -1224,6 +1150,11 @@ if __name__ == "__main__":
         "--license-path",
         default="",
         help="license.json 路径（默认=程序同目录的 license.json）",
+    )
+    parser.add_argument(
+        "--models",
+        default="",
+        help="多模型模式：逗号分隔的模型列表。提交阶段将按模型数量一次提交多条任务；轮询阶段每60秒轮询表内所有未结束任务。",
     )
     args = parser.parse_args()
     if args.logout:
@@ -1266,7 +1197,8 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     try:
-        main(args.project_dir, debug_login=args.debug_login)
+        models = [m.strip() for m in (args.models or "").split(",") if m.strip()]
+        main(args.project_dir, debug_login=args.debug_login, models=models)
     except KeyboardInterrupt:
         print("\n已退出：用户中断（退出成功）")
         raise SystemExit(0)
