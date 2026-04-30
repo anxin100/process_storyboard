@@ -154,33 +154,51 @@ def parse_json_maybe(text: str):
         return None
 
 
-def check_dreamina_logged_in() -> bool:
+def get_dreamina_user_credit():
     """
-    使用 dreamina user_credit 作为登录自检。
-    文档建议：能返回包含余额信息的 JSON 即认为登录态可用。
+    获取当前账号信息（dreamina user_credit）。
+    成功返回 dict；失败返回 None。
     """
     dreamina = get_dreamina_path()
     if not os.path.exists(dreamina):
         print(f"未找到 dreamina 可执行文件：{dreamina}")
-        return False
+        return None
 
     cmd = f"\"{dreamina}\" user_credit"
     code, stdout, stderr = run_command(cmd)
     if code != 0:
         print(f"user_credit 失败（code={code}）：{stderr}")
-        return False
+        return None
 
     data = parse_json_maybe(stdout)
     if not isinstance(data, dict):
         print(f"user_credit 输出不是JSON：{stdout}")
-        return False
+        return None
 
-    # 不严格限定字段名，只要是 dict 且非空即可
     if not data:
         print("user_credit 返回空JSON，视为未登录/不可用")
-        return False
+        return None
 
-    return True
+    return data
+
+
+def check_dreamina_logged_in() -> bool:
+    """
+    使用 dreamina user_credit 作为登录自检。
+    文档建议：能返回包含余额信息的 JSON 即认为登录态可用。
+    """
+    return isinstance(get_dreamina_user_credit(), dict)
+
+
+def ensure_dreamina_maestro() -> None:
+    """
+    调用 dreamina 生成/查询接口前的权限校验：
+    若 vip_level != maestro，则提示并报错退出。
+    """
+    data = get_dreamina_user_credit() or {}
+    vip_level = data.get("vip_level")
+    if str(vip_level).lower() != "maestro":
+        raise RuntimeError("当前账号没有 dreamina_cli 使用权限: current account is not maestro vip")
 
 
 def ensure_dreamina_logged_in(debug_login: bool = False) -> None:
@@ -646,6 +664,8 @@ def main(project_dir, debug_login: bool = False):
 
     # 启动先确保登录态可用（否则后续 query/text2video 会失败）
     ensure_dreamina_logged_in(debug_login=debug_login)
+    # 登录态可用后，再检查账号是否具备 dreamina_cli 权限
+    ensure_dreamina_maestro()
 
     project_name = get_project_name(project_dir)
 
