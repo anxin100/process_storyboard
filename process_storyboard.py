@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import shutil
 import subprocess
 import platform
 import pandas as pd
@@ -125,8 +126,57 @@ def get_dreamina_bundle_dir() -> str:
 
 
 def get_dreamina_cli_home() -> str:
-    bundle_dir = get_dreamina_bundle_dir()
-    return os.path.join(bundle_dir, ".dreamina_cli")
+    """
+    Dreamina CLI 的数据目录（登录态、db、logs 等）。
+
+    重要：PyInstaller onefile 下，vendor 位于 sys._MEIPASS（解包临时目录），
+    该目录不应作为持久化/写入位置。否则会出现“不会创建 db/logs / 登录态丢失”的现象。
+
+    规则：
+    - 若外部已设置 DREAMINA_CLI_HOME：尊重该值
+    - 否则默认使用 ~/.dreamina_cli（与官方安装脚本一致）
+    """
+    env_home = os.environ.get("DREAMINA_CLI_HOME")
+    if env_home:
+        return env_home
+    return os.path.join(os.path.expanduser("~"), ".dreamina_cli")
+
+
+def ensure_dreamina_cli_home_seeded() -> None:
+    """
+    若目标 DREAMINA_CLI_HOME 为空，则从随包 vendor 的 .dreamina_cli 拷贝基础文件：
+    - dreamina/SKILL.md
+    - version.json
+    这样既兼容离线打包，又保证写入目录是用户可写、可持久化的。
+    """
+    target_home = get_dreamina_cli_home()
+    try:
+        os.makedirs(target_home, exist_ok=True)
+    except Exception:
+        return
+
+    # 如果目标目录已有内容，则不再拷贝
+    try:
+        if os.listdir(target_home):
+            return
+    except Exception:
+        return
+
+    bundle_home = os.path.join(get_dreamina_bundle_dir(), ".dreamina_cli")
+    if not os.path.isdir(bundle_home):
+        return
+
+    for root, _dirs, files in os.walk(bundle_home):
+        rel = os.path.relpath(root, bundle_home)
+        dst_root = target_home if rel == "." else os.path.join(target_home, rel)
+        os.makedirs(dst_root, exist_ok=True)
+        for name in files:
+            src = os.path.join(root, name)
+            dst = os.path.join(dst_root, name)
+            try:
+                shutil.copy2(src, dst)
+            except Exception:
+                pass
 
 
 def get_dreamina_path() -> str:
@@ -154,33 +204,56 @@ def parse_json_maybe(text: str):
         return None
 
 
+def get_dreamina_user_credit():
+    """
+    获取当前账号的余额/权限信息（dreamina user_credit）。
+    成功返回 dict；失败返回 None。
+    """
+    dreamina = get_dreamina_path()
+    if not os.path.exists(dreamina):
+        print(f"未找到 dreamina 可执行文件：{dreamina}")
+        return None
+
+    ensure_dreamina_cli_home_seeded()
+    cmd = f"\"{dreamina}\" user_credit"
+    code, stdout, stderr = run_command(cmd)
+    print(f"user_credit 返回码：{code}")
+    print(f"user_credit 输出：{stdout}")
+    print(f"user_credit 错误：{stderr}")
+    if code != 0:
+        print(f"user_credit 失败（code={code}）：{stderr}")
+        return None
+
+    data = parse_json_maybe(stdout)
+    if not isinstance(data, dict):
+        print(f"user_credit 输出不是JSON：{stdout}")
+        return None
+
+    if not data:
+        print("user_credit 返回空JSON，视为未登录/不可用")
+        return None
+
+    return data
+
+
 def check_dreamina_logged_in() -> bool:
     """
     使用 dreamina user_credit 作为登录自检。
     文档建议：能返回包含余额信息的 JSON 即认为登录态可用。
     """
-    dreamina = get_dreamina_path()
-    if not os.path.exists(dreamina):
-        print(f"未找到 dreamina 可执行文件：{dreamina}")
-        return False
+    return isinstance(get_dreamina_user_credit(), dict)
 
-    cmd = f"\"{dreamina}\" user_credit"
-    code, stdout, stderr = run_command(cmd)
-    if code != 0:
-        print(f"user_credit 失败（code={code}）：{stderr}")
-        return False
 
-    data = parse_json_maybe(stdout)
-    if not isinstance(data, dict):
-        print(f"user_credit 输出不是JSON：{stdout}")
-        return False
-
-    # 不严格限定字段名，只要是 dict 且非空即可
-    if not data:
-        print("user_credit 返回空JSON，视为未登录/不可用")
-        return False
-
-    return True
+def ensure_dreamina_maestro() -> None:
+    """
+    在调用 dreamina 生成/查询等接口前做权限校验。
+    鉴权/退出接口（login/logout 等）除外。
+    规则：vip_level != maestro 则报错。
+    """
+    data = get_dreamina_user_credit()
+    vip_level = (data or {}).get("vip_level")
+    if str(vip_level).lower() != "maestro":
+        raise RuntimeError("当前账号没有 dreamina_cli 使用权限: current account is not maestro vip")
 
 
 def ensure_dreamina_logged_in(debug_login: bool = False) -> None:
@@ -194,6 +267,7 @@ def ensure_dreamina_logged_in(debug_login: bool = False) -> None:
         return
 
     dreamina = get_dreamina_path()
+    ensure_dreamina_cli_home_seeded()
     def _print_login_result(code: int, stdout: str, stderr: str) -> None:
         print(f"login 返回码：{code}")
         if stdout:
@@ -242,6 +316,26 @@ def ensure_dreamina_logged_in(debug_login: bool = False) -> None:
         raise RuntimeError("登录后自检仍失败：请检查 ~/.dreamina_cli/logs/ 日志；也可尝试手动执行 dreamina login（或更新 dreamina 版本后再试）")
 
 
+def dreamina_logout() -> int:
+    """
+    退出 Dreamina（清理本地 OAuth 登录态）。
+    对应官方命令：dreamina logout
+    """
+    dreamina = get_dreamina_path()
+    if not os.path.exists(dreamina):
+        print(f"未找到 dreamina 可执行文件：{dreamina}")
+        return 1
+
+    cmd = f"\"{dreamina}\" logout"
+    code, stdout, stderr = run_command(cmd)
+    print(f"logout 返回码：{code}")
+    if stdout:
+        print(stdout)
+    if stderr:
+        print(stderr)
+    return 0 if code == 0 else code
+
+
 def run_command(cmd):
     """运行命令并返回结果"""
     try:
@@ -254,11 +348,13 @@ def run_command(cmd):
         else:
             full_cmd = f'DREAMINA_CLI_HOME="{cli_home}" {cmd}'
         print(f"执行完整命令：{full_cmd}")
-        # 统一以 bytes 捕获输出，再手动解码，避免 Windows 下 _readerthread 因默认 GBK 解码崩溃
+        # 统一以 bytes 捕获“合并后的输出”（stdout+stderr），避免某些 CLI 只写 stderr/或混合输出导致丢失错误信息。
+        # 同时也避免 Windows 下 _readerthread 因默认 GBK 解码崩溃（我们自己解码 bytes）。
         result = subprocess.run(
-            full_cmd, 
-            shell=True, 
-            capture_output=True, 
+            full_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             cwd=runtime_dir,
         )
 
@@ -276,7 +372,43 @@ def run_command(cmd):
             return b.decode("utf-8", errors="replace")
 
         stdout = _decode(result.stdout)
-        stderr = _decode(result.stderr)
+        stderr = ""
+
+        def _read_latest_log_excerpt(base_dir: str, max_chars: int = 4000) -> str:
+            logs_dir = os.path.join(base_dir, "logs")
+            if not os.path.isdir(logs_dir):
+                return ""
+            try:
+                entries = []
+                for name in os.listdir(logs_dir):
+                    p = os.path.join(logs_dir, name)
+                    if os.path.isfile(p):
+                        try:
+                            entries.append((os.path.getmtime(p), p))
+                        except Exception:
+                            pass
+                if not entries:
+                    return ""
+                entries.sort(key=lambda x: x[0], reverse=True)
+                latest_path = entries[0][1]
+                with open(latest_path, "rb") as f:
+                    data = f.read()
+                text = _decode(data)
+                if len(text) > max_chars:
+                    text = text[-max_chars:]
+                return f"\n[dreamina logs tail] {latest_path}\n{text}\n"
+            except Exception:
+                return ""
+
+        # 某些版本在非 TTY 下失败时不输出到终端（即使合并流也为空），而是写入 logs；这里补打一段尾部方便定位。
+        if result.returncode != 0 and (not stdout.strip()):
+            log_excerpt = _read_latest_log_excerpt(cli_home)
+            if log_excerpt:
+                stdout = (stdout or "") + log_excerpt
+
+        print(f"run_command 命令返回码：{result.returncode}")
+        print(f"run_command 命令输出：{stdout}")
+        print(f"run_command 命令错误：{stderr}")
         return result.returncode, stdout, stderr
     except Exception as e:
         return -1, "", str(e)
@@ -359,7 +491,26 @@ def query_task_status(submit_id):
         dreamina = get_dreamina_path()
         cmd = f'"{dreamina}" query_result --submit_id={submit_id}'
         code, stdout, stderr = run_command(cmd)
-        # 无论返回码如何，都尝试解析输出
+        # 先处理一些明确的非 JSON 文本错误（避免无意义的 JSON 重试）
+        out = (stdout or "").strip()
+        low = out.lower()
+        if "current account is not maestro vip" in low:
+            return "fail", {
+                "gen_status": "fail",
+                "submit_id": submit_id,
+                "fail_reason": "current account is not maestro vip",
+                "raw": out,
+            }
+        if "task" in low and "not found" in low:
+            # 这是本地任务库里不存在该 submit_id（或 submit_id 无效）的明确错误
+            return "not_found", {
+                "gen_status": "not_found",
+                "submit_id": submit_id,
+                "fail_reason": "task not found",
+                "raw": out,
+            }
+
+        # 无论返回码如何，都尝试解析输出（成功时为 JSON）
         try:
             data = json.loads(stdout)
             # 使用gen_status字段而不是status字段
@@ -375,7 +526,7 @@ def query_task_status(submit_id):
                 time.sleep(5)
             else:
                 # 只有3次都失败后才返回 unknown 状态
-                return 'unknown', {"gen_status": "unknown", "submit_id": submit_id}
+                return 'unknown', {"gen_status": "unknown", "submit_id": submit_id, "raw": out}
 
 def generate_video(prompt, scene=None, character_images=None, project_dir='', screen_size='横屏'):
     """生成视频"""
@@ -390,6 +541,11 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
     
     # 打印调试信息
     print(f"调试信息：scene={scene}, character_images={character_images}, project_dir={project_dir}, screen_size={screen_size}, ratio={ratio}")
+
+    dreamina = get_dreamina_path()
+    if not os.path.exists(dreamina):
+        print(f"未找到 dreamina 可执行文件：{dreamina}")
+        return None, f"未找到 dreamina：{dreamina}"
     
     # 处理场景图片
     if scene:
@@ -434,10 +590,10 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
     # 确保至少有一个图片参数
     if not image_args:
         # 如果没有图片，使用text2video命令
-        cmd = f'./dreamina text2video --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
+        cmd = f'"{dreamina}" text2video --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
         print(f"没有图片输入，使用text2video命令：{cmd}")
     else:
-        cmd = f'./dreamina multimodal2video {image_args} --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
+        cmd = f'"{dreamina}" multimodal2video {image_args} --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
         print(f"执行命令：{cmd}")
     
     # 执行命令
@@ -625,6 +781,8 @@ def main(project_dir, debug_login: bool = False):
 
     # 启动先确保登录态可用（否则后续 query/text2video 会失败）
     ensure_dreamina_logged_in(debug_login=debug_login)
+    # 登录态可用后，再检查账号是否具备 dreamina_cli 权限
+    ensure_dreamina_maestro()
 
     project_name = get_project_name(project_dir)
 
@@ -937,10 +1095,17 @@ if __name__ == "__main__":
         help="项目目录路径（默认=程序同名目录；目录内需包含：<项目名>分镜.xlsx、角色名/ 等）",
     )
     parser.add_argument(
+        "--logout",
+        action="store_true",
+        help="执行 dreamina logout 清理本地登录态后退出",
+    )
+    parser.add_argument(
         "--debug-login",
         action="store_true",
         help="若需要登录，则执行 dreamina login --debug（用于排查登录卡住/浏览器未拉起等问题）",
     )
     args = parser.parse_args()
+    if args.logout:
+        raise SystemExit(dreamina_logout())
     main(args.project_dir, debug_login=args.debug_login)
 
