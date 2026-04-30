@@ -295,7 +295,7 @@ def run_command(cmd):
 
         if isinstance(cmd, (list, tuple)):
             printable = " ".join([str(x) for x in cmd])
-            print(f"执行完整命令：{printable}")
+            print(f"执行完整命令 shell=False：{printable}")
             # shell=False：可以安全传递包含换行的参数值（例如 prompt）
             result = subprocess.run(
                 list(cmd),
@@ -494,28 +494,33 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
         cmd = [
             dreamina,
             "text2video",
+            f"--ratio={ratio}",
+            "--duration=15",
+            "--video_resolution=720P",
+            "--model_version=seedance2.0fast",
+            # 放到最后：避免 prompt 内换行导致后续参数“被吞”
             "--prompt",
             prompt,
+        ]
+        print("没有图片输入，使用text2video命令。")
+    else:
+        cmd = [
+            dreamina,
+            "multimodal2video",
             f"--ratio={ratio}",
             "--duration=15",
             "--video_resolution=720P",
             "--model_version=seedance2.0fast",
         ]
-        print("没有图片输入，使用text2video命令。")
-    else:
-        cmd = [dreamina, "multimodal2video"]
         # image_params 目前是 '--image <path>' 字符串，拆成两个参数
         for p in image_params:
             if p.startswith("--image "):
                 cmd.extend(["--image", p.split(" ", 1)[1]])
         cmd.extend(
             [
+                # 放到最后：避免 prompt 内换行导致后续参数“被吞”
                 "--prompt",
                 prompt,
-                f"--ratio={ratio}",
-                "--duration=15",
-                "--video_resolution=720P",
-                "--model_version=seedance2.0fast",
             ]
         )
         print("执行 multimodal2video 命令。")
@@ -706,7 +711,7 @@ def main(project_dir, debug_login: bool = False):
     # 启动先确保登录态可用（否则后续 query/text2video 会失败）
     ensure_dreamina_logged_in(debug_login=debug_login)
     # 登录态可用后，再检查账号是否具备 dreamina_cli 权限
-    ensure_dreamina_maestro()
+    # ensure_dreamina_maestro()
 
     project_name = get_project_name(project_dir)
 
