@@ -136,6 +136,8 @@ def compute_machine_raw_id() -> str:
 
 def compute_machine_id() -> str:
     raw_id = compute_machine_raw_id()
+    if raw_id.endswith(":unknown"):
+        raise RuntimeError("无法获取机器标识，无法离线授权。请使用管理员权限/放开企业策略后重试。")
     payload = (f"{PRODUCT_ID}|v1|" + raw_id).encode("utf-8")
     digest = hashlib.sha256(payload).digest()
     b32 = base64.b32encode(digest).decode("ascii").rstrip("=")
@@ -1228,7 +1230,12 @@ if __name__ == "__main__":
         raise SystemExit(dreamina_logout())
 
     if args.print_machine_id:
-        mid = compute_machine_id()
+        try:
+            mid = compute_machine_id()
+        except Exception as e:
+            print(f"错误：{e}")
+            print("联系方式：微信号：shenxian9409")
+            raise SystemExit(1)
         print(f"机器码：{mid}")
         print("联系方式：微信号：shenxian9409")
         raise SystemExit(0)
@@ -1236,7 +1243,26 @@ if __name__ == "__main__":
     license_path = args.license_path.strip() if args.license_path else ""
     if not license_path:
         license_path = os.path.join(get_app_dir(), "license.json")
-    enforce_license(license_path)
+    try:
+        enforce_license(license_path)
+    except FileNotFoundError:
+        print("未授权：未找到 license.json。")
+        print("请按以下步骤获取授权：")
+        print("1) 在程序所在目录运行：")
+        print("   ./process_storyboard --print-machine-id")
+        print("2) 将输出的“机器码”发送给授权方以获取 license.json。")
+        print("联系方式：微信号：shenxian9409")
+        print("3) 将收到的 license.json 放到程序同目录后重新运行。")
+        raise SystemExit(1)
+    except Exception as e:
+        print(f"未授权或授权校验失败：{e}")
+        print("如需获取授权，请运行：./process_storyboard --print-machine-id")
+        print("联系方式：微信号：shenxian9409")
+        raise SystemExit(1)
 
-    main(args.project_dir, debug_login=args.debug_login)
+    try:
+        main(args.project_dir, debug_login=args.debug_login)
+    except KeyboardInterrupt:
+        print("\n已退出：用户中断（退出成功）")
+        raise SystemExit(0)
 
