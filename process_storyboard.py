@@ -166,6 +166,9 @@ def check_dreamina_logged_in() -> bool:
 
     cmd = f"\"{dreamina}\" user_credit"
     code, stdout, stderr = run_command(cmd)
+    print(f"user_credit 返回码：{code}")
+    print(f"user_credit 输出：{stdout}")
+    print(f"user_credit 错误：{stderr}")
     if code != 0:
         print(f"user_credit 失败（code={code}）：{stderr}")
         return False
