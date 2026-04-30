@@ -52,7 +52,12 @@ jobs:
           CLI_PATH="dist-cli/process_storyboard"
           ZIP_PATH="dist-cli/process_storyboard-${VERSION}-mac-${{ matrix.arch }}-cli.zip"
           test -f "$CLI_PATH"
-          ditto -c -k --keepParent "$CLI_PATH" "$ZIP_PATH"
+          rm -rf dist-cli/package
+          mkdir -p dist-cli/package
+          cp -f "$CLI_PATH" "dist-cli/package/process_storyboard"
+          cp -f "run.command" "dist-cli/package/run.command"
+          chmod +x "dist-cli/package/run.command" || true
+          ditto -c -k --keepParent "dist-cli/package" "$ZIP_PATH"
 
       - name: PyInstaller (mac .app)
         run: |
@@ -99,6 +104,7 @@ jobs:
           path: |
             dist-cli/process_storyboard
             dist-cli/process_storyboard-*-mac-${{ matrix.arch }}-cli.zip
+            run.command
             dist-app/process_storyboard.app
             dist-app/process_storyboard-*-mac-${{ matrix.arch }}-app.zip
             dist-app/process_storyboard-*-mac-${{ matrix.arch }}.dmg
@@ -125,12 +131,27 @@ jobs:
           $env:DREAMINA_PLATFORM_KEY = "windows_amd64"
           pyinstaller --noconfirm --clean process_storyboard_cli.spec
 
+      - name: Zip windows (exe + launcher)
+        shell: pwsh
+        run: |
+          $raw = "${env:GITHUB_REF_NAME}"
+          if ([string]::IsNullOrEmpty($raw)) { $raw = "0.0.0" }
+          $version = $raw -replace '^v',''
+          New-Item -ItemType Directory -Force -Path dist-win | Out-Null
+          Copy-Item -Force dist\process_storyboard.exe dist-win\process_storyboard.exe
+          Copy-Item -Force run.bat dist-win\run.bat
+          $zipPath = "dist-win\process_storyboard-$version-windows-cli.zip"
+          if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+          Compress-Archive -Path dist-win\process_storyboard.exe,dist-win\run.bat -DestinationPath $zipPath
+
       - name: Upload artifacts (windows)
         uses: actions/upload-artifact@v4
         with:
           name: windows-artifacts
           path: |
             dist/process_storyboard.exe
+            dist-win/process_storyboard-*-windows-cli.zip
+            run.bat
 
   release:
     needs: [mac, windows]
@@ -168,6 +189,7 @@ jobs:
             release-assets/mac/arm64/dist-app/process_storyboard-*-mac-arm64-app.zip
             release-assets/mac/arm64/dist-app/process_storyboard-*-mac-arm64.dmg
             release-assets/mac/arm64/dist-app/process_storyboard-*-mac-arm64.pkg
+            release-assets/win/**/process_storyboard-*-windows-cli.zip
             release-assets/win/**/process_storyboard.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

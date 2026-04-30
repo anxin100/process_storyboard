@@ -1256,7 +1256,12 @@ if __name__ == "__main__":
         raise SystemExit(1)
     except Exception as e:
         print(f"未授权或授权校验失败：{e}")
-        print("如需获取授权，请运行：./process_storyboard --print-machine-id")
+        try:
+            mid = compute_machine_id()
+            print(f"机器码：{mid}")
+        except Exception:
+            pass
+        print("获取机器码命令：./process_storyboard --print-machine-id")
         print("联系方式：微信号：shenxian9409")
         raise SystemExit(1)
 

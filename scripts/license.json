@@ -21,5 +21,10 @@
   "migration": {
     "mode": "manual",
     "note": "需人工换机：请联系授权方签发新 license"
+  },
+  "signature": {
+    "alg": "ed25519",
+    "key_id": "K1",
+    "value": "aAE0sKGieKGK3bGqRDuXeUWNhf5MxM0V63dwEq2RscM6/wOGWoV0kPOCG5IlOHHRIt/cB5aTS3KfFSRrcTgzAg=="
   }
 }
