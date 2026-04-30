@@ -711,7 +711,7 @@ def main(project_dir, debug_login: bool = False):
     # 启动先确保登录态可用（否则后续 query/text2video 会失败）
     ensure_dreamina_logged_in(debug_login=debug_login)
     # 登录态可用后，再检查账号是否具备 dreamina_cli 权限
-    # ensure_dreamina_maestro()
+    ensure_dreamina_maestro()
 
     project_name = get_project_name(project_dir)
 
