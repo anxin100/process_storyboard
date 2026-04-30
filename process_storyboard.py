@@ -390,6 +390,11 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
     
     # 打印调试信息
     print(f"调试信息：scene={scene}, character_images={character_images}, project_dir={project_dir}, screen_size={screen_size}, ratio={ratio}")
+
+    dreamina = get_dreamina_path()
+    if not os.path.exists(dreamina):
+        print(f"未找到 dreamina 可执行文件：{dreamina}")
+        return None, f"未找到 dreamina：{dreamina}"
     
     # 处理场景图片
     if scene:
@@ -434,10 +439,10 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
     # 确保至少有一个图片参数
     if not image_args:
         # 如果没有图片，使用text2video命令
-        cmd = f'./dreamina text2video --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
+        cmd = f'"{dreamina}" text2video --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
         print(f"没有图片输入，使用text2video命令：{cmd}")
     else:
-        cmd = f'./dreamina multimodal2video {image_args} --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
+        cmd = f'"{dreamina}" multimodal2video {image_args} --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
         print(f"执行命令：{cmd}")
     
     # 执行命令
