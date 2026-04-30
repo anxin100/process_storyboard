@@ -9,6 +9,8 @@ import requests
 import webbrowser
 
 import argparse
+import threading
+import queue
 
 
 def get_runtime_dir():
@@ -434,7 +436,7 @@ def query_task_status(submit_id):
                 # 只有3次都失败后才返回 unknown 状态
                 return 'unknown', {"gen_status": "unknown", "submit_id": submit_id}
 
-def generate_video(prompt, scene=None, character_images=None, project_dir='', screen_size='横屏'):
+def generate_video(prompt, scene=None, character_images=None, project_dir='', screen_size='横屏', model_version='seedance2.0fast'):
     """生成视频"""
     # 构建图片参数
     image_params = []
@@ -446,7 +448,7 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
         ratio = '16:9'
     
     # 打印调试信息
-    print(f"调试信息：scene={scene}, character_images={character_images}, project_dir={project_dir}, screen_size={screen_size}, ratio={ratio}")
+    print(f"调试信息：scene={scene}, character_images={character_images}, project_dir={project_dir}, screen_size={screen_size}, ratio={ratio}, model_version={model_version}")
 
     # 注意：prompt 允许包含换行；调用 dreamina 时需用 argv 方式传参，避免 shell 把换行当作命令分隔符
     
@@ -497,7 +499,7 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
             f"--ratio={ratio}",
             "--duration=15",
             "--video_resolution=720P",
-            "--model_version=seedance2.0fast",
+            f"--model_version={model_version}",
             # 放到最后：避免 prompt 内换行导致后续参数“被吞”
             "--prompt",
             prompt,
@@ -510,7 +512,7 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
             f"--ratio={ratio}",
             "--duration=15",
             "--video_resolution=720P",
-            "--model_version=seedance2.0fast",
+            f"--model_version={model_version}",
         ]
         # image_params 目前是 '--image <path>' 字符串，拆成两个参数
         for p in image_params:
@@ -548,6 +550,191 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
         submit_id = f"test_{random.randint(10000000, 99999999)}"
         print(f"解析响应失败，使用模拟任务ID：{submit_id}")
         return submit_id, None
+
+
+class TaskManager:
+    """任务管理器：多线程模式下负责任务分发与 Excel 写回。"""
+
+    def __init__(self, excel_path: str, output_dir: str):
+        self.excel_path = excel_path
+        self.output_dir = output_dir
+        self.lock = threading.Lock()
+        self.task_queue: "queue.Queue[int]" = queue.Queue()
+        self.running = True
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def load_tasks(self) -> bool:
+        if not os.path.exists(self.excel_path):
+            print(f"文件 {self.excel_path} 不存在")
+            return False
+        df = pd.read_excel(self.excel_path)
+        if '视频是否保存' in df.columns:
+            df['视频是否保存'] = df['视频是否保存'].astype(str).replace('nan', '')
+        if '编号' in df.columns:
+            df = df.sort_values('编号')
+        for index, row in df.iterrows():
+            video_saved = row.get('视频是否保存', '')
+            if pd.isna(video_saved) or str(video_saved).strip() != '是':
+                self.task_queue.put(index)
+        print(f"加载了 {self.task_queue.qsize()} 个待处理任务")
+        return True
+
+    def get_task_index(self):
+        try:
+            return self.task_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def get_row(self, index: int):
+        with self.lock:
+            df = pd.read_excel(self.excel_path)
+            if index not in df.index:
+                return None
+            return df.loc[index]
+
+    def update_task(self, index: int, task_id=None, status=None, video_path=None, video_saved=None):
+        with self.lock:
+            df = pd.read_excel(self.excel_path)
+            if index not in df.index:
+                return
+            if task_id is not None:
+                df.at[index, '任务ID'] = task_id
+            if status is not None:
+                df.at[index, '状态'] = status
+            if video_path is not None:
+                df.at[index, '视频位置'] = video_path
+            if video_saved is not None:
+                df.at[index, '视频是否保存'] = video_saved
+            df.to_excel(self.excel_path, index=False)
+
+    def is_running(self) -> bool:
+        return self.running and not self.task_queue.empty()
+
+
+def worker_thread(task_manager: TaskManager, project_dir: str, model_version: str):
+    """工作线程：使用指定模型版本处理任务提交/轮询/下载。"""
+    thread_id = threading.get_ident()
+    print(f"[{thread_id}] 启动工作线程，使用模型：{model_version}")
+
+    retry_keywords = [
+        'ExceedConcurrencyLimit',
+        'pre-TNS check did not pass',
+        'post-TNS check did not pass',
+        'final generation failed',
+        'upload resource',
+        'upload image'
+    ]
+
+    while task_manager.is_running():
+        idx = task_manager.get_task_index()
+        if idx is None:
+            time.sleep(1)
+            continue
+
+        row = task_manager.get_row(idx)
+        if row is None:
+            task_manager.task_queue.task_done()
+            continue
+
+        print(f"[{thread_id}] ----------------------------------------------------------------")
+        print(f"[{thread_id}] 线程 {model_version} 处理编号 {row.get('编号', 'N/A')}")
+
+        # 跳过已保存
+        video_saved = row.get('视频是否保存', '')
+        if not pd.isna(video_saved) and str(video_saved).strip() == '是':
+            task_manager.task_queue.task_done()
+            continue
+
+        task_id = row.get('任务ID', '')
+        if pd.isna(task_id):
+            task_id = ''
+
+        # 已有任务：查询/下载
+        if task_id:
+            status, data = query_task_status(task_id)
+            if status == 'success':
+                output_file = os.path.join(task_manager.output_dir, f"{row.get('编号', 'N/A')}_{task_id}.mp4")
+                if download_video_http(task_id, output_file, data):
+                    task_manager.update_task(idx, video_path=output_file, status='成功', video_saved='是')
+            elif status in ['queued', 'generating', 'querying']:
+                # 继续等待：保持单线程逻辑一致（轮询）
+                max_wait_time = 3600 * 5
+                start_time = time.time()
+                while status in ['queued', 'generating', 'querying']:
+                    if time.time() - start_time > max_wait_time:
+                        break
+                    time.sleep(60)
+                    status, data = query_task_status(task_id)
+                if status == 'success':
+                    output_file = os.path.join(task_manager.output_dir, f"{row.get('编号', 'N/A')}_{task_id}.mp4")
+                    if download_video_http(task_id, output_file, data):
+                        task_manager.update_task(idx, video_path=output_file, status='成功', video_saved='是')
+                elif status == 'fail':
+                    fail_reason = (data or {}).get('fail_reason', '未知失败原因')
+                    need_retry = any(keyword in fail_reason for keyword in retry_keywords)
+                    if need_retry:
+                        task_manager.update_task(idx, task_id='', status='')
+                        task_manager.task_queue.put(idx)
+                    else:
+                        task_manager.update_task(idx, status='失败')
+            elif status in ['rejected', 'cancelled', 'fail']:
+                task_manager.update_task(idx, task_id='', status='')
+                task_manager.task_queue.put(idx)
+            else:
+                # unknown：不做处理，避免死循环刷 Excel
+                pass
+
+            task_manager.task_queue.task_done()
+            continue
+
+        # 无任务：提交生成
+        original_prompt = row.get('视频提示词', '')
+        if not original_prompt:
+            task_manager.task_queue.task_done()
+            continue
+
+        scene = row.get('场景', '')
+        if pd.isna(scene):
+            scene = ''
+        scene_str = f"场景=@{scene}.png。" if scene else ""
+
+        character_images = row.get('角色图', '')
+        if pd.isna(character_images):
+            character_images = ''
+        character_str = ""
+        if character_images:
+            import re
+            characters = re.split('[，,]', character_images)
+            characters = [c.strip() for c in characters if c.strip()]
+            if characters:
+                character_parts = [f"{c}=@{c}.png" for c in characters]
+                character_str = "，".join(character_parts) + "。"
+
+        prompt = scene_str + character_str + original_prompt
+
+        screen_size = row.get('屏幕尺寸', '横屏')
+        if pd.isna(screen_size):
+            screen_size = '横屏'
+
+        submit_id, error = generate_video(prompt, scene, character_images, project_dir, screen_size, model_version=model_version)
+        if submit_id:
+            if isinstance(error, tuple) and error[0] == 'fail':
+                _status, fail_reason = error
+                need_retry = any(keyword in fail_reason for keyword in retry_keywords)
+                if need_retry:
+                    time.sleep(60)
+                    task_manager.update_task(idx, task_id='', status='')
+                    task_manager.task_queue.put(idx)
+                else:
+                    task_manager.update_task(idx, status='失败')
+            else:
+                task_manager.update_task(idx, task_id=submit_id, status='生成中')
+        else:
+            task_manager.update_task(idx, status='失败')
+
+        task_manager.task_queue.task_done()
+
+    print(f"[{thread_id}] 工作线程 {model_version} 退出")
 
 
 def download_file_from_url(url: str, output_path: str, timeout_seconds: int = 300, chunk_size: int = 1024 * 1024) -> bool:
@@ -694,7 +881,7 @@ def download_video(submit_id, output_path, data=None):
             os.remove(output_path)
         return False
 
-def main(project_dir, debug_login: bool = False):
+def main(project_dir, debug_login: bool = False, model_version: str = "seedance2.0fast", models=None):
     project_dir = resolve_project_dir(project_dir)
     if not project_dir:
         print("project_dir 为空，请使用 --project-dir 指定项目目录")
@@ -725,6 +912,26 @@ def main(project_dir, debug_login: bool = False):
     # 创建输出目录
     output_dir = os.path.join(project_dir, "output_videos")
     os.makedirs(output_dir, exist_ok=True)
+
+    # 多线程（按模型列表跑）：仅当显式传入 models 且长度>=1 才启用；否则保持原单线程逻辑
+    if models:
+        model_list = [m.strip() for m in models if str(m).strip()]
+        if not model_list:
+            model_list = [model_version]
+        tm = TaskManager(excel_path=excel_path, output_dir=output_dir)
+        if not tm.load_tasks():
+            return
+        threads = []
+        for mv in model_list:
+            t = threading.Thread(target=worker_thread, args=(tm, project_dir, mv))
+            t.daemon = True
+            threads.append(t)
+            t.start()
+            print(f"线程 {mv} 已启动")
+        for t in threads:
+            t.join()
+        print("所有任务处理完成")
+        return
     
     # 读取数据
     df = pd.read_excel(excel_path)
@@ -901,7 +1108,7 @@ def main(project_dir, debug_login: bool = False):
                 screen_size = '横屏'
 
             # 生成视频
-            submit_id, error = generate_video(prompt, scene, character_images, project_dir, screen_size)
+            submit_id, error = generate_video(prompt, scene, character_images, project_dir, screen_size, model_version=model_version)
             if submit_id:
                 # 检查是否直接返回了失败状态
                 if isinstance(error, tuple) and error[0] == 'fail':
@@ -1033,8 +1240,19 @@ if __name__ == "__main__":
         action="store_true",
         help="若需要登录，则执行 dreamina login --debug（用于排查登录卡住/浏览器未拉起等问题）",
     )
+    parser.add_argument(
+        "--model-version",
+        default="seedance2.0fast",
+        help="生成时使用的 dreamina 模型版本（默认 seedance2.0fast）",
+    )
+    parser.add_argument(
+        "--models",
+        default="",
+        help="启用多线程：按逗号分隔的模型列表（每个模型一个线程），例如：seedance2.0fast,seedance2.0",
+    )
     args = parser.parse_args()
     if args.logout:
         raise SystemExit(dreamina_logout())
-    main(args.project_dir, debug_login=args.debug_login)
+    models = [m.strip() for m in (args.models or "").split(",") if m.strip()]
+    main(args.project_dir, debug_login=args.debug_login, model_version=args.model_version, models=models)
 
