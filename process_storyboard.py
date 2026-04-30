@@ -242,6 +242,26 @@ def ensure_dreamina_logged_in(debug_login: bool = False) -> None:
         raise RuntimeError("登录后自检仍失败：请检查 ~/.dreamina_cli/logs/ 日志；也可尝试手动执行 dreamina login（或更新 dreamina 版本后再试）")
 
 
+def dreamina_logout() -> int:
+    """
+    退出 Dreamina（清理本地 OAuth 登录态）。
+    对应官方命令：dreamina logout
+    """
+    dreamina = get_dreamina_path()
+    if not os.path.exists(dreamina):
+        print(f"未找到 dreamina 可执行文件：{dreamina}")
+        return 1
+
+    cmd = f"\"{dreamina}\" logout"
+    code, stdout, stderr = run_command(cmd)
+    print(f"logout 返回码：{code}")
+    if stdout:
+        print(stdout)
+    if stderr:
+        print(stderr)
+    return 0 if code == 0 else code
+
+
 def run_command(cmd):
     """运行命令并返回结果"""
     try:
@@ -938,10 +958,17 @@ if __name__ == "__main__":
         help="项目目录路径（默认=程序同名目录；目录内需包含：<项目名>分镜.xlsx、角色名/ 等）",
     )
     parser.add_argument(
+        "--logout",
+        action="store_true",
+        help="执行 dreamina logout 清理本地登录态后退出",
+    )
+    parser.add_argument(
         "--debug-login",
         action="store_true",
         help="若需要登录，则执行 dreamina login --debug（用于排查登录卡住/浏览器未拉起等问题）",
     )
     args = parser.parse_args()
+    if args.logout:
+        raise SystemExit(dreamina_logout())
     main(args.project_dir, debug_login=args.debug_login)
 
