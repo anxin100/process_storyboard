@@ -164,7 +164,7 @@ def get_dreamina_user_credit():
         print(f"未找到 dreamina 可执行文件：{dreamina}")
         return None
 
-    cmd = f"\"{dreamina}\" user_credit"
+    cmd = [dreamina, "user_credit"]
     code, stdout, stderr = run_command(cmd)
     if code != 0:
         print(f"user_credit 失败（code={code}）：{stderr}")
@@ -270,7 +270,7 @@ def dreamina_logout() -> int:
         print(f"未找到 dreamina 可执行文件：{dreamina}")
         return 1
 
-    cmd = f"\"{dreamina}\" logout"
+    cmd = [dreamina, "logout"]
     code, stdout, stderr = run_command(cmd)
     print(f"logout 返回码：{code}")
     if stdout:
@@ -281,24 +281,43 @@ def dreamina_logout() -> int:
 
 
 def run_command(cmd):
-    """运行命令并返回结果"""
+    """运行命令并返回结果
+
+    支持两种形式：
+    - cmd 为 str：shell=True（兼容旧逻辑；不适合携带含换行的参数）
+    - cmd 为 list/tuple：shell=False（推荐；可安全传递包含换行/引号的参数，如 --prompt）
+    """
     try:
-        # 直接在命令中设置DREAMINA_CLI_HOME
         runtime_dir = get_runtime_dir()
         cli_home = get_dreamina_cli_home()
-        if os.name == "nt":
-            # Windows cmd：不能用 Unix 的 VAR="..." bash 语法
-            full_cmd = f'set "DREAMINA_CLI_HOME={cli_home}" && {cmd}'
+        env = os.environ.copy()
+        env["DREAMINA_CLI_HOME"] = cli_home
+
+        if isinstance(cmd, (list, tuple)):
+            printable = " ".join([str(x) for x in cmd])
+            print(f"执行完整命令：{printable}")
+            # shell=False：可以安全传递包含换行的参数值（例如 prompt）
+            result = subprocess.run(
+                list(cmd),
+                shell=False,
+                capture_output=True,
+                cwd=runtime_dir,
+                env=env,
+            )
         else:
-            full_cmd = f'DREAMINA_CLI_HOME="{cli_home}" {cmd}'
-        print(f"执行完整命令：{full_cmd}")
-        # 统一以 bytes 捕获输出，再手动解码，避免 Windows 下 _readerthread 因默认 GBK 解码崩溃
-        result = subprocess.run(
-            full_cmd, 
-            shell=True, 
-            capture_output=True, 
-            cwd=runtime_dir,
-        )
+            # shell=True 兼容旧逻辑：通过命令前缀设置 DREAMINA_CLI_HOME
+            if os.name == "nt":
+                full_cmd = f'set "DREAMINA_CLI_HOME={cli_home}" && {cmd}'
+            else:
+                full_cmd = f'DREAMINA_CLI_HOME="{cli_home}" {cmd}'
+            print(f"执行完整命令：{full_cmd}")
+            # 统一以 bytes 捕获输出，再手动解码，避免 Windows 下 _readerthread 因默认 GBK 解码崩溃
+            result = subprocess.run(
+                full_cmd,
+                shell=True,
+                capture_output=True,
+                cwd=runtime_dir,
+            )
 
         def _decode(b) -> str:
             if b is None:
@@ -395,7 +414,7 @@ def query_task_status(submit_id):
     max_attempts = 3
     for attempt in range(max_attempts):
         dreamina = get_dreamina_path()
-        cmd = f'"{dreamina}" query_result --submit_id={submit_id}'
+        cmd = [dreamina, "query_result", f"--submit_id={submit_id}"]
         code, stdout, stderr = run_command(cmd)
         # 无论返回码如何，都尝试解析输出
         try:
@@ -428,6 +447,8 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
     
     # 打印调试信息
     print(f"调试信息：scene={scene}, character_images={character_images}, project_dir={project_dir}, screen_size={screen_size}, ratio={ratio}")
+
+    # 注意：prompt 允许包含换行；调用 dreamina 时需用 argv 方式传参，避免 shell 把换行当作命令分隔符
     
     # 处理场景图片
     if scene:
@@ -466,18 +487,38 @@ def generate_video(prompt, scene=None, character_images=None, project_dir='', sc
                 else:
                     print("角色名为空，跳过")
     
-    # 构建命令
-    image_args = " ".join(image_params)
-    print(f"构建的图片参数：{image_args}")
-    # 确保至少有一个图片参数
+    # 构建命令（用 list 传参，避免 prompt 内换行/引号导致 shell 截断）
     dreamina = get_dreamina_path()
-    if not image_args:
-        # 如果没有图片，使用text2video命令
-        cmd = f'"{dreamina}" text2video --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
-        print(f"没有图片输入，使用text2video命令：{cmd}")
+    print(f"构建的图片参数：{' '.join(image_params)}")
+    if not image_params:
+        cmd = [
+            dreamina,
+            "text2video",
+            "--prompt",
+            prompt,
+            f"--ratio={ratio}",
+            "--duration=15",
+            "--video_resolution=720P",
+            "--model_version=seedance2.0fast",
+        ]
+        print("没有图片输入，使用text2video命令。")
     else:
-        cmd = f'"{dreamina}" multimodal2video {image_args} --prompt="{prompt}" --ratio={ratio} --duration=15 --video_resolution=720P --model_version=seedance2.0fast'
-        print(f"执行命令：{cmd}")
+        cmd = [dreamina, "multimodal2video"]
+        # image_params 目前是 '--image <path>' 字符串，拆成两个参数
+        for p in image_params:
+            if p.startswith("--image "):
+                cmd.extend(["--image", p.split(" ", 1)[1]])
+        cmd.extend(
+            [
+                "--prompt",
+                prompt,
+                f"--ratio={ratio}",
+                "--duration=15",
+                "--video_resolution=720P",
+                "--model_version=seedance2.0fast",
+            ]
+        )
+        print("执行 multimodal2video 命令。")
     
     # 执行命令
     code, stdout, stderr = run_command(cmd)
