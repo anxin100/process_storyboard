@@ -4,11 +4,16 @@ import time
 import json
 import subprocess
 import platform
+import hashlib
+import base64
+from datetime import datetime, timezone
 import pandas as pd
 import requests
 import webbrowser
 
 import argparse
+
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 
 def get_runtime_dir():
@@ -20,6 +25,181 @@ def get_runtime_dir():
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return sys._MEIPASS
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_app_dir() -> str:
+    """
+    返回用户看到的“程序所在目录”，用于读取同目录的 license.json：
+    - PyInstaller：sys.executable 所在目录
+    - 源码运行：脚本所在目录
+    """
+    try:
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(os.path.realpath(sys.executable))
+    except Exception:
+        pass
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+PRODUCT_ID = "process_storyboard"
+LICENSE_VERSION = 1
+
+# 内置公钥（base64 of raw 32 bytes），由你用 scripts/license_keygen.py 生成后替换
+PUBLIC_KEYS_B64 = {
+    "K1": "<m+VeK5SuMgXIftR1TI46ZHuG1uNRq5Z1VI+4/zrX2mw=>",
+}
+
+
+def canonical_json_bytes(obj: dict) -> bytes:
+    # 排序 + 最小化空白，确保签名稳定；ensure_ascii=False 允许中文
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def parse_rfc3339(s: str) -> datetime:
+    # 接受 "Z" 结尾
+    s = (s or "").strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+
+def compute_machine_raw_id() -> str:
+    """
+    获取稳定的机器原始标识（raw_id），用于派生 machine_id。
+    - Windows：优先 MachineGuid，其次 BIOS UUID
+    - macOS：优先 IOPlatformUUID
+    - Linux：优先 /etc/machine-id
+    """
+    system = platform.system().lower()
+
+    if system == "windows":
+        # 1) MachineGuid
+        try:
+            import winreg  # type: ignore
+
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography")
+            val, _typ = winreg.QueryValueEx(key, "MachineGuid")
+            if val:
+                return f"win:machineguid:{str(val).strip()}"
+        except Exception:
+            pass
+
+        # 2) BIOS UUID
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_ComputerSystemProduct).UUID"],
+                capture_output=True,
+                text=True,
+            )
+            uuid = (r.stdout or "").strip()
+            if uuid and uuid.lower() != "ffffffff-ffff-ffff-ffff-ffffffffffff":
+                return f"win:biosuuid:{uuid}"
+        except Exception:
+            pass
+
+        return "win:unknown"
+
+    if system == "darwin":
+        try:
+            r = subprocess.run(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                capture_output=True,
+                text=True,
+            )
+            text = r.stdout or ""
+            key = "IOPlatformUUID"
+            for line in text.splitlines():
+                if key in line:
+                    # ... "IOPlatformUUID" = "XXXX"
+                    parts = line.split("=", 1)
+                    if len(parts) == 2:
+                        val = parts[1].strip().strip('"')
+                        val = val.strip()
+                        if val:
+                            return f"mac:ioplatformuuid:{val}"
+        except Exception:
+            pass
+        return "mac:unknown"
+
+    # linux / others
+    for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    mid = f.read().strip()
+                if mid:
+                    return f"linux:machineid:{mid}"
+        except Exception:
+            pass
+    return f"{system}:unknown"
+
+
+def compute_machine_id() -> str:
+    raw_id = compute_machine_raw_id()
+    payload = (f"{PRODUCT_ID}|v1|" + raw_id).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    b32 = base64.b32encode(digest).decode("ascii").rstrip("=")
+    return f"MID-{b32}"
+
+
+def load_license(license_path: str) -> dict:
+    with open(license_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def verify_license_or_raise(license_obj: dict) -> None:
+    if license_obj.get("product") != PRODUCT_ID:
+        raise RuntimeError("license 无效：product 不匹配")
+    if int(license_obj.get("license_version", -1)) != LICENSE_VERSION:
+        raise RuntimeError("license 无效：license_version 不匹配")
+
+    sig = license_obj.get("signature") or {}
+    if sig.get("alg") != "ed25519":
+        raise RuntimeError("license 无效：signature.alg 不支持（仅支持 ed25519）")
+    key_id = sig.get("key_id")
+    sig_b64 = sig.get("value")
+    if not key_id or not sig_b64:
+        raise RuntimeError("license 无效：缺少 signature.key_id 或 signature.value")
+    pub_b64 = PUBLIC_KEYS_B64.get(str(key_id))
+    if not pub_b64:
+        raise RuntimeError(f"license 无效：未配置公钥 key_id={key_id}（请在代码中填充 PUBLIC_KEYS_B64）")
+
+    # payload = canonical(json without signature)
+    payload_obj = dict(license_obj)
+    payload_obj.pop("signature", None)
+    payload = canonical_json_bytes(payload_obj)
+
+    pub = ed25519.Ed25519PublicKey.from_public_bytes(base64.b64decode(pub_b64))
+    try:
+        pub.verify(base64.b64decode(sig_b64), payload)
+    except Exception:
+        raise RuntimeError("license 无效：签名校验失败（文件被篡改或签发密钥不匹配）")
+
+    validity = license_obj.get("validity") or {}
+    not_before = validity.get("not_before")
+    if not_before:
+        if datetime.now(timezone.utc) < parse_rfc3339(not_before).astimezone(timezone.utc):
+            raise RuntimeError("license 未生效：未到 not_before 时间")
+    is_perpetual = bool(validity.get("is_perpetual", False))
+    not_after = validity.get("not_after")
+    if (not is_perpetual) and not_after:
+        if datetime.now(timezone.utc) > parse_rfc3339(not_after).astimezone(timezone.utc):
+            raise RuntimeError("license 已过期：超过 not_after 时间")
+
+    binding = license_obj.get("binding") or {}
+    if binding.get("type") != "machine":
+        raise RuntimeError("license 无效：binding.type 必须为 machine")
+    machine_ids = binding.get("machine_ids") or []
+    if not isinstance(machine_ids, list) or not machine_ids:
+        raise RuntimeError("license 无效：binding.machine_ids 不能为空")
+    mid = compute_machine_id()
+    if mid not in machine_ids:
+        raise RuntimeError(f"license 无效：机器不匹配（本机 {mid} 不在授权列表中）")
+
+
+def enforce_license(license_path: str) -> None:
+    lic = load_license(license_path)
+    verify_license_or_raise(lic)
 
 
 def get_app_container_dir() -> str:
@@ -1033,8 +1213,30 @@ if __name__ == "__main__":
         action="store_true",
         help="若需要登录，则执行 dreamina login --debug（用于排查登录卡住/浏览器未拉起等问题）",
     )
+    parser.add_argument(
+        "--print-machine-id",
+        action="store_true",
+        help="打印本机 machine_id（用于离线授权绑定）",
+    )
+    parser.add_argument(
+        "--license-path",
+        default="",
+        help="license.json 路径（默认=程序同目录的 license.json）",
+    )
     args = parser.parse_args()
     if args.logout:
         raise SystemExit(dreamina_logout())
+
+    if args.print_machine_id:
+        mid = compute_machine_id()
+        print(f"机器码：{mid}")
+        print("联系方式：微信号：shenxian9409")
+        raise SystemExit(0)
+
+    license_path = args.license_path.strip() if args.license_path else ""
+    if not license_path:
+        license_path = os.path.join(get_app_dir(), "license.json")
+    enforce_license(license_path)
+
     main(args.project_dir, debug_login=args.debug_login)
 

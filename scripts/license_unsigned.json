@@ -1,0 +1,26 @@
+{
+  "license_version": 1,
+  "product": "process_storyboard",
+  "license_id": "LIC-2026-000001",
+  "issued_at": "2026-04-30T00:00:00Z",
+  "validity": {
+    "not_before": "2026-04-30T00:00:00Z",
+    "is_perpetual": false,
+    "not_after": "2027-04-30T00:00:00Z"
+  },
+  "customer": {
+    "name": "客户A",
+    "contact": "a@example.com"
+  },
+  "binding": {
+    "type": "machine",
+    "machine_ids": [
+      "MID-REPLACE_WITH_CUSTOMER_MACHINE_ID"
+    ]
+  },
+  "migration": {
+    "mode": "manual",
+    "note": "需人工换机：请联系授权方签发新 license"
+  }
+}
+
