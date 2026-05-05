@@ -59,6 +59,9 @@ jobs:
           chmod +x "dist-cli/package/run.command" || true
           ditto -c -k --keepParent "dist-cli/package" "$ZIP_PATH"
 
+      - name: Verify license_sign bundle inputs
+        run: test -f scripts/license_common.py && test -f scripts/license_sign.py
+
       - name: PyInstaller (license_sign, mac)
         run: |
           rm -rf dist-license-sign build-license-sign
@@ -162,6 +165,12 @@ jobs:
           $zipPath = "dist-win\process_storyboard-$version-windows-cli.zip"
           if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
           Compress-Archive -Path dist-win\process_storyboard.exe,dist-win\run.bat -DestinationPath $zipPath
+
+      - name: Verify license_sign bundle inputs
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "scripts/license_common.py")) { throw "missing scripts/license_common.py" }
+          if (-not (Test-Path "scripts/license_sign.py")) { throw "missing scripts/license_sign.py" }
 
       - name: PyInstaller (license_sign, windows)
         shell: pwsh

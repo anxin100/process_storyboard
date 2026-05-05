@@ -5,9 +5,16 @@
 - Windows: dist/license_sign.exe
 """
 
+import os
+
 from PyInstaller.building.api import EXE, PYZ
 from PyInstaller.building.build_main import Analysis
 from PyInstaller.utils.hooks import collect_all
+
+# 必须把 scripts 放进搜索路径，否则 sibling 模块 license_common 在 Analysis 阶段找不到，
+# onefile 运行时会出现 ModuleNotFoundError: license_common（Windows/macOS 均可能发生）。
+_SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
+_SCRIPTS_DIR = os.path.join(_SPEC_DIR, "scripts")
 
 block_cipher = None
 
@@ -26,7 +33,7 @@ for pkg in ("cryptography",):
 
 a = Analysis(
     ["scripts/license_sign.py"],
-    pathex=[],
+    pathex=[_SCRIPTS_DIR],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports + ["license_common"],
