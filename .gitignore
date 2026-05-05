@@ -10,6 +10,8 @@ ENV/
 # PyInstaller
 build/
 dist/
+build-license-sign/
+dist-license-sign/
 
 # Local runtime data
 .dreamina_cli/

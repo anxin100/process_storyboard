@@ -59,6 +59,23 @@ jobs:
           chmod +x "dist-cli/package/run.command" || true
           ditto -c -k --keepParent "dist-cli/package" "$ZIP_PATH"
 
+      - name: PyInstaller (license_sign, mac)
+        run: |
+          rm -rf dist-license-sign build-license-sign
+          pyinstaller --noconfirm --clean \
+            --distpath dist-license-sign --workpath build-license-sign \
+            license_sign.spec
+
+      - name: Zip license_sign (mac)
+        run: |
+          RAW_VER="${GITHUB_REF_NAME:-0.0.0}"
+          VERSION="${RAW_VER#v}"
+          BIN="dist-license-sign/license_sign"
+          ZIP_PATH="dist-license-sign/license_sign-${VERSION}-mac-${{ matrix.arch }}.zip"
+          test -f "$BIN"
+          rm -f "$ZIP_PATH"
+          zip -j "$ZIP_PATH" "$BIN"
+
       - name: PyInstaller (mac .app)
         run: |
           rm -rf dist-app build-app
@@ -109,6 +126,8 @@ jobs:
             dist-app/process_storyboard-*-mac-${{ matrix.arch }}-app.zip
             dist-app/process_storyboard-*-mac-${{ matrix.arch }}.dmg
             dist-app/process_storyboard-*-mac-${{ matrix.arch }}.pkg
+            dist-license-sign/license_sign
+            dist-license-sign/license_sign-*-mac-${{ matrix.arch }}.zip
 
   windows:
     runs-on: windows-latest
@@ -144,6 +163,25 @@ jobs:
           if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
           Compress-Archive -Path dist-win\process_storyboard.exe,dist-win\run.bat -DestinationPath $zipPath
 
+      - name: PyInstaller (license_sign, windows)
+        shell: pwsh
+        run: |
+          if (Test-Path dist-license-sign) { Remove-Item -Recurse -Force dist-license-sign }
+          if (Test-Path build-license-sign) { Remove-Item -Recurse -Force build-license-sign }
+          pyinstaller --noconfirm --clean --distpath dist-license-sign --workpath build-license-sign license_sign.spec
+
+      - name: Zip license_sign (windows)
+        shell: pwsh
+        run: |
+          $raw = "${env:GITHUB_REF_NAME}"
+          if ([string]::IsNullOrEmpty($raw)) { $raw = "0.0.0" }
+          $version = $raw -replace '^v',''
+          $exe = "dist-license-sign\license_sign.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $zipPath = "dist-license-sign\license_sign-$version-windows.zip"
+          if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+          Compress-Archive -Path $exe -DestinationPath $zipPath
+
       - name: Upload artifacts (windows)
         uses: actions/upload-artifact@v4
         with:
@@ -152,6 +190,8 @@ jobs:
             dist/process_storyboard.exe
             dist-win/process_storyboard-*-windows-cli.zip
             run.bat
+            dist-license-sign/license_sign.exe
+            dist-license-sign/license_sign-*-windows.zip
 
   release:
     needs: [mac, windows]
@@ -191,5 +231,7 @@ jobs:
             release-assets/mac/arm64/dist-app/process_storyboard-*-mac-arm64.pkg
             release-assets/win/**/process_storyboard-*-windows-cli.zip
             release-assets/win/**/process_storyboard.exe
+            release-assets/mac/arm64/dist-license-sign/license_sign-*-mac-arm64.zip
+            release-assets/win/**/license_sign-*-windows.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

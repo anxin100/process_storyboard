@@ -1,0 +1,25 @@
+{
+  "license_version": 1,
+  "product": "process_storyboard",
+  "license_id": "LIC-2026-B3CB78BD",
+  "issued_at": "2026-05-04T15:38:17Z",
+  "validity": {
+    "not_before": "2026-05-04T15:38:17Z",
+    "is_perpetual": true,
+    "not_after": null
+  },
+  "customer": {
+    "name": "客户A",
+    "contact": "a@example.com"
+  },
+  "binding": {
+    "type": "machine",
+    "machine_ids": [
+      "MID-XXXX"
+    ]
+  },
+  "migration": {
+    "mode": "manual",
+    "note": "需人工换机：请联系授权方签发新 license"
+  }
+}

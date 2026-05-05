@@ -1,0 +1,32 @@
+{
+  "license_version": 1,
+  "product": "process_storyboard",
+  "license_id": "LIC-2026-98817361",
+  "issued_at": "2026-05-04T15:55:33Z",
+  "validity": {
+    "not_before": "2026-05-04T15:55:33Z",
+    "is_perpetual": true,
+    "not_after": null
+  },
+  "customer": {
+    "name": "某某公司",
+    "contact": "zhang@example.com"
+  },
+  "binding": {
+    "type": "machine",
+    "machine_ids": [
+      "MID-AAAAAAAA",
+      "MID-BBBBBBBB",
+      "MID-CCCCCCCC"
+    ]
+  },
+  "migration": {
+    "mode": "manual",
+    "note": "需人工换机：请联系授权方签发新 license"
+  },
+  "signature": {
+    "alg": "ed25519",
+    "key_id": "K1",
+    "value": "XoqA/AbPUroUAE/fKCmUwbrnoYyCQLqmNW+wuPTGVEkNydfCDTFtQfBSmTSGFcmaES4MeXMEPknmSd3C1TuGDw=="
+  }
+}
