@@ -12,6 +12,7 @@ import requests
 import webbrowser
 
 import argparse
+from typing import List, Optional
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
@@ -953,19 +954,45 @@ def main(project_dir, debug_login: bool = False, models=None):
     if not model_list:
         model_list = ["seedance2.0fast"]
 
-    # 主循环：每隔 60 秒轮询一次所有未结束任务
+    n_slots = len(model_list)
+    # 槽位 i 对应模型 model_list[i]；值为当前占用该槽的 DataFrame 行索引，None 表示空闲
+    slot_busy: List[Optional[int]] = [None] * n_slots
+
+    def _tid_str(row) -> str:
+        task_id = row.get("任务ID", "")
+        if pd.isna(task_id):
+            task_id = ""
+        return str(task_id).replace("nan", "").strip()
+
+    def release_slot(row_index: int) -> None:
+        for si in range(n_slots):
+            if slot_busy[si] == row_index:
+                slot_busy[si] = None
+                return
+
+    def hydrate_slots_from_excel() -> None:
+        """启动时根据表里已有任务占槽（先出现的优先），便于续跑与槽位一致。"""
+        pending = []
+        for index, row in df.iterrows():
+            if is_done_row(row):
+                continue
+            if _tid_str(row):
+                pending.append(index)
+        for si in range(min(n_slots, len(pending))):
+            slot_busy[si] = pending[si]
+
+    hydrate_slots_from_excel()
+
+    # 主循环：每隔 60 秒轮询一次所有未结束任务；按槽位补提交保持至多 N 条在途
     while True:
-        any_inflight = False
+        poll_inflight = False
 
         # 1) 轮询所有未结束的任务ID（不再卡住单个 ID）
         for index, row in df.iterrows():
             if is_done_row(row):
                 continue
 
-            task_id = row.get('任务ID', '')
-            if pd.isna(task_id):
-                task_id = ''
-            task_id = str(task_id).replace('nan', '').strip()
+            task_id = _tid_str(row)
             if not task_id:
                 continue
 
@@ -990,11 +1017,12 @@ def main(project_dir, debug_login: bool = False, models=None):
                     if elapsed > 5 * 3600:
                         df.at[index, '状态'] = '超时'
                         print(f"任务超时：已超过5小时（编号 {row.get('编号', 'N/A')}，任务ID={task_id}）")
+                        release_slot(index)
                         continue
                 except Exception:
                     # 提交时间解析失败则重置
                     df.at[index, '提交时间'] = now_rfc3339_z()
-                any_inflight = True
+                poll_inflight = True
                 continue
 
             if status == 'success':
@@ -1004,6 +1032,7 @@ def main(project_dir, debug_login: bool = False, models=None):
                     df.at[index, '状态'] = '成功'
                     df.at[index, '视频是否保存'] = '是'
                     print(f"视频下载成功：{output_file}")
+                    release_slot(index)
                 else:
                     print("视频下载失败")
                 continue
@@ -1012,6 +1041,7 @@ def main(project_dir, debug_login: bool = False, models=None):
                 print(f"任务状态：{status}，清空任务ID")
                 df.at[index, '任务ID'] = ''
                 df.at[index, '状态'] = ''
+                release_slot(index)
                 continue
 
             if status == 'fail':
@@ -1022,36 +1052,31 @@ def main(project_dir, debug_login: bool = False, models=None):
                     print(f"失败原因：{fail_reason}，清空任务ID并重新执行")
                     df.at[index, '任务ID'] = ''
                     df.at[index, '状态'] = ''
+                    release_slot(index)
                 else:
                     df.at[index, '状态'] = '失败'
+                    release_slot(index)
                 continue
 
             print(f"未知任务状态：{status}")
 
-        # 2) 提交阶段：只有在“没有任何在途任务”时才提交；一次按模型数量提交 N 条
-        if not any_inflight:
-            to_submit = []  # list[(index, row)]
+        # 2) 按槽位补提交：每个空闲槽位立刻尝试补一条，保持至多 N 条在途（槽 i -> model_list[i]）
+        occupied_by_slot = {idx for idx in slot_busy if idx is not None}
+
+        for si in range(n_slots):
+            if slot_busy[si] is not None:
+                continue
+            mv = model_list[si]
+            picked = False
             for index, row in df.iterrows():
-                if len(to_submit) >= len(model_list):
-                    break
                 if is_done_row(row):
                     continue
-                task_id = row.get('任务ID', '')
-                if pd.isna(task_id):
-                    task_id = ''
-                task_id = str(task_id).replace('nan', '').strip()
-                if task_id:
+                if index in occupied_by_slot:
+                    continue
+                if _tid_str(row):
                     continue
                 original_prompt = row.get('视频提示词', '')
-                if not original_prompt:
-                    continue
-                to_submit.append((index, row))
-
-            for i, (index, row) in enumerate(to_submit):
-                mv = model_list[i % len(model_list)]
-                original_prompt = row.get('视频提示词', '')
-                if not original_prompt:
-                    print(f"跳过编号 {row.get('编号', 'N/A')}：无视频提示词")
+                if pd.isna(original_prompt) or not str(original_prompt).strip():
                     continue
 
                 scene = row.get('场景', '')
@@ -1073,21 +1098,21 @@ def main(project_dir, debug_login: bool = False, models=None):
 
                 prompt = scene_str + character_str + original_prompt
                 print(f"----------------------------------------------------------------")
-                print(f"生成视频：编号 {row.get('编号', 'N/A')}（模型 {mv}）")
+                print(f"生成视频：编号 {row.get('编号', 'N/A')}（槽位 {si + 1}/{n_slots}，模型 {mv}）")
 
                 screen_size = row.get('屏幕尺寸', '横屏')
                 if pd.isna(screen_size):
                     screen_size = '横屏'
 
                 submit_id, error = generate_video(prompt, scene, character_images, project_dir, screen_size, model_version=mv)
+                picked = True
                 if submit_id:
                     if isinstance(error, tuple) and error[0] == 'fail':
                         _status, fail_reason = error
                         print(f"任务提交失败：{fail_reason}")
                         need_retry = any(keyword in fail_reason for keyword in retry_keywords)
                         if need_retry:
-                            print("等待60秒后重新尝试提交")
-                            any_inflight = True
+                            print("等待60秒后重新尝试提交（本槽位下一轮再试）")
                         else:
                             df.at[index, '状态'] = '失败'
                     else:
@@ -1095,29 +1120,21 @@ def main(project_dir, debug_login: bool = False, models=None):
                         df.at[index, '状态'] = '生成中'
                         df.at[index, '提交时间'] = now_rfc3339_z()
                         print(f"生成任务已提交：{submit_id}")
-                        any_inflight = True
+                        slot_busy[si] = index
+                        occupied_by_slot.add(index)
                 else:
                     print(f"生成视频失败：{error}")
                     df.at[index, '状态'] = '失败'
+                break
+            if not picked:
+                continue
 
         # 3) 保存 Excel
         df.to_excel(excel_path, index=False)
         print("Excel文件已更新")
 
-        # 4) 退出条件：没有在途任务 + 没有可提交的新任务
-        has_unsubmitted = False
-        for _idx, _row in df.iterrows():
-            if is_done_row(_row):
-                continue
-            _task_id = _row.get('任务ID', '')
-            if pd.isna(_task_id):
-                _task_id = ''
-            if not str(_task_id).replace('nan', '').strip():
-                # 仍有未提交的行
-                has_unsubmitted = True
-                break
-
-        if (not any_inflight) and (not has_unsubmitted):
+        # 4) 退出条件：所有行均已结束（成功落盘 / 超时等 is_done_row）
+        if not any((not is_done_row(r)) for _, r in df.iterrows()):
             print("所有任务处理完成，退出脚本")
             return
 
@@ -1154,7 +1171,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--models",
         default="",
-        help="多模型模式：逗号分隔的模型列表。提交阶段将按模型数量一次提交多条任务；轮询阶段每60秒轮询表内所有未结束任务。",
+        help="多模型模式：逗号分隔模型列表，槽位数=列表长度；每个槽绑定一个模型，在途任务结束即在该槽补提交下一条。轮询每60秒扫表内所有未结束任务。",
     )
     args = parser.parse_args()
     if args.logout:
