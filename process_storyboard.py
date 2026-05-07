@@ -1326,12 +1326,15 @@ if __name__ == "__main__":
         enforce_license(license_path)
     except FileNotFoundError:
         print("未授权：未找到 license.json。")
+        try:
+            mid = compute_machine_id()
+            print(f"机器码：{mid}")
+        except Exception:
+            print("获取机器码命令：./process_storyboard --print-machine-id")
         print("请按以下步骤获取授权：")
-        print("1) 在程序所在目录运行：")
-        print("   ./process_storyboard --print-machine-id")
-        print("2) 将输出的“机器码”发送给授权方以获取 license.json。")
+        print("1) 将上面的「机器码」发送给授权方以获取 license.json。")
         print("联系方式：微信号：shenxian9409")
-        print("3) 将收到的 license.json 放到程序同目录后重新运行。")
+        print("2) 将收到的 license.json 放到程序同目录后重新运行。")
         raise SystemExit(1)
     except Exception as e:
         print(f"未授权或授权校验失败：{e}")
