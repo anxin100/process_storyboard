@@ -20,22 +20,43 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 
 def safe_write_excel(df: pd.DataFrame, excel_path: str) -> None:
-    """原子写入 xlsx，降低中途崩溃或未保存导致丢数据的风险。"""
+    """尽量原子写入 xlsx。Windows 下若目标正被 Excel 独占，os.replace 会 PermissionError，此处重试并降级，不至于崩溃。"""
     excel_path = os.path.abspath(excel_path)
     d = os.path.dirname(excel_path)
     os.makedirs(d, exist_ok=True)
     stem = os.path.splitext(os.path.basename(excel_path))[0]
     pid = os.getpid()
     tid = threading.get_ident()
-    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", prefix=f".{stem}.tmp.{pid}.{tid}.", dir=d)
+    # 前缀不以 . 开头，避免个别环境下对「隐藏临时文件」附加策略干扰
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", prefix=f"{stem}.tmp.{pid}.{tid}.", dir=d)
     os.close(fd)
+    tmp_to_remove = tmp_path
     try:
         df.to_excel(tmp_path, index=False)
-        os.replace(tmp_path, excel_path)
-    finally:
-        if os.path.exists(tmp_path):
+        for delay in (0, 0.2, 0.5, 1.0, 2.0):
+            if delay:
+                time.sleep(delay)
             try:
-                os.remove(tmp_path)
+                os.replace(tmp_path, excel_path)
+                tmp_to_remove = None
+                return
+            except (PermissionError, OSError):
+                continue
+        try:
+            df.to_excel(excel_path, index=False)
+            tmp_to_remove = None
+            return
+        except (PermissionError, OSError) as e:
+            print(
+                "警告：无法写入分镜 Excel（文件可能被 Excel 或其他程序打开并锁定）。\n"
+                "请先关闭该 .xlsx 后再运行；运行期间尽量不要用 Excel 打开同一文件。\n"
+                f"路径：{excel_path}\n错误：{e}"
+            )
+            return
+    finally:
+        if tmp_to_remove and os.path.exists(tmp_to_remove):
+            try:
+                os.remove(tmp_to_remove)
             except OSError:
                 pass
 
