@@ -139,10 +139,10 @@ jobs:
           $version = $raw -replace '^v',''
           New-Item -ItemType Directory -Force -Path dist-win | Out-Null
           Copy-Item -Force dist\process_storyboard.exe dist-win\process_storyboard.exe
-          Copy-Item -Force run.bat dist-win\run.bat
+          Copy-Item -Force run.ps1 dist-win\run.ps1
           $zipPath = "dist-win\process_storyboard-$version-windows-cli.zip"
           if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
-          Compress-Archive -Path dist-win\process_storyboard.exe,dist-win\run.bat -DestinationPath $zipPath
+          Compress-Archive -Path dist-win\process_storyboard.exe,dist-win\run.ps1 -DestinationPath $zipPath
 
       - name: Upload artifacts (windows)
         uses: actions/upload-artifact@v4
@@ -151,7 +151,7 @@ jobs:
           path: |
             dist/process_storyboard.exe
             dist-win/process_storyboard-*-windows-cli.zip
-            run.bat
+            run.ps1
 
   release:
     needs: [mac, windows]

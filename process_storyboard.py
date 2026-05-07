@@ -1,5 +1,7 @@
 import os
 import sys
+import tempfile
+import threading
 import time
 import json
 import subprocess
@@ -15,6 +17,27 @@ import argparse
 from typing import List, Optional
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
+
+
+def safe_write_excel(df: pd.DataFrame, excel_path: str) -> None:
+    """原子写入 xlsx，降低中途崩溃或未保存导致丢数据的风险。"""
+    excel_path = os.path.abspath(excel_path)
+    d = os.path.dirname(excel_path)
+    os.makedirs(d, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(excel_path))[0]
+    pid = os.getpid()
+    tid = threading.get_ident()
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", prefix=f".{stem}.tmp.{pid}.{tid}.", dir=d)
+    os.close(fd)
+    try:
+        df.to_excel(tmp_path, index=False)
+        os.replace(tmp_path, excel_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def get_runtime_dir():
@@ -914,7 +937,9 @@ def main(project_dir, debug_login: bool = False, models=None):
     
     # 读取数据
     df = pd.read_excel(excel_path)
-    
+    # 去掉列名首尾空格，避免与模板列名不一致导致读不到「任务ID」
+    df.columns = pd.Index([str(c).strip() for c in df.columns])
+
     # 转换列数据类型
     if '任务ID' in df.columns:
         df['任务ID'] = df['任务ID'].astype(str).replace('nan', '')
@@ -931,13 +956,13 @@ def main(project_dir, debug_login: bool = False, models=None):
     if '编号' in df.columns:
         df = df.sort_values('编号')
     
-    retry_keywords = [
+    # 仅用于「提交阶段」generate_video 返回失败时决定是否下一轮再试（与轮询 query_result 无关）
+    submit_retry_keywords = [
         'ExceedConcurrencyLimit',
         'pre-TNS check did not pass',
         'post-TNS check did not pass',
-        'final generation failed',
         'upload resource',
-        'upload image'
+        'upload image',
     ]
 
     def is_done_row(r) -> bool:
@@ -947,6 +972,9 @@ def main(project_dir, debug_login: bool = False, models=None):
         # 超时视为结束（不再轮询）
         status = r.get('状态', '')
         if not pd.isna(status) and str(status).strip() == '超时':
+            return True
+        # 轮询得到终端失败并已写入「失败…」后不再轮询；清空任务ID由人工处理
+        if not pd.isna(status) and str(status).strip().startswith('失败'):
             return True
         return False
 
@@ -962,7 +990,21 @@ def main(project_dir, debug_login: bool = False, models=None):
         task_id = row.get("任务ID", "")
         if pd.isna(task_id):
             task_id = ""
-        return str(task_id).replace("nan", "").strip()
+        s = str(task_id).replace("nan", "").strip()
+        if not s or s.lower() == "nan":
+            return ""
+        return s
+
+    def _should_skip_for_submit(row) -> bool:
+        """已有任务 ID，或已标记「生成中」的行：只允许轮询，禁止进入补提交。"""
+        if _tid_str(row):
+            return True
+        st = row.get("状态", "")
+        if pd.isna(st):
+            st = ""
+        if str(st).strip() == "生成中":
+            return True
+        return False
 
     def release_slot(row_index: int) -> None:
         for si in range(n_slots):
@@ -994,6 +1036,12 @@ def main(project_dir, debug_login: bool = False, models=None):
 
             task_id = _tid_str(row)
             if not task_id:
+                st = row.get("状态", "")
+                if not pd.isna(st) and str(st).strip() == "生成中":
+                    print(
+                        f"警告：编号 {row.get('编号', 'N/A')} 状态为「生成中」但任务ID为空，无法轮询；"
+                        "请检查 Excel 或清空状态列后重试。"
+                    )
                 continue
 
             print(f"处理编号 {row.get('编号', 'N/A')}：任务ID = {task_id}")
@@ -1047,21 +1095,24 @@ def main(project_dir, debug_login: bool = False, models=None):
             if status == 'fail':
                 fail_reason = (data or {}).get('fail_reason', '未知失败原因')
                 print(f"任务失败：{fail_reason}")
-                need_retry = any(keyword in fail_reason for keyword in retry_keywords)
-                if need_retry:
-                    print(f"失败原因：{fail_reason}，清空任务ID并重新执行")
-                    df.at[index, '任务ID'] = ''
-                    df.at[index, '状态'] = ''
-                    release_slot(index)
-                else:
-                    df.at[index, '状态'] = '失败'
-                    release_slot(index)
+                # 保留任务ID，仅写入状态供人工核对；不自动清空任务ID（避免误删可追溯记录）
+                short = str(fail_reason).replace("\r", " ").replace("\n", "; ")
+                if len(short) > 300:
+                    short = short[:297] + "..."
+                df.at[index, '状态'] = f"失败：{short}"
+                release_slot(index)
                 continue
 
             print(f"未知任务状态：{status}")
 
+        safe_write_excel(df, excel_path)
+        print("轮询阶段结果已写入 Excel")
+
         # 2) 按槽位补提交：每个空闲槽位立刻尝试补一条，保持至多 N 条在途（槽 i -> model_list[i]）
+        #    已有任务ID（含「生成中」）的行只参与上面轮询，不得进入补提交。
+        #    同一轮补提交内，禁止多槽对同一行尝试（API 失败未写入任务ID 时，否则两槽会重复提交同一分镜）。
         occupied_by_slot = {idx for idx in slot_busy if idx is not None}
+        submit_attempted_this_round: set = set()
 
         for si in range(n_slots):
             if slot_busy[si] is not None:
@@ -1073,7 +1124,9 @@ def main(project_dir, debug_login: bool = False, models=None):
                     continue
                 if index in occupied_by_slot:
                     continue
-                if _tid_str(row):
+                if index in submit_attempted_this_round:
+                    continue
+                if _should_skip_for_submit(row):
                     continue
                 original_prompt = row.get('视频提示词', '')
                 if pd.isna(original_prompt) or not str(original_prompt).strip():
@@ -1104,13 +1157,15 @@ def main(project_dir, debug_login: bool = False, models=None):
                 if pd.isna(screen_size):
                     screen_size = '横屏'
 
+                submit_attempted_this_round.add(index)
+
                 submit_id, error = generate_video(prompt, scene, character_images, project_dir, screen_size, model_version=mv)
                 picked = True
                 if submit_id:
                     if isinstance(error, tuple) and error[0] == 'fail':
                         _status, fail_reason = error
                         print(f"任务提交失败：{fail_reason}")
-                        need_retry = any(keyword in fail_reason for keyword in retry_keywords)
+                        need_retry = any(keyword in fail_reason for keyword in submit_retry_keywords)
                         if need_retry:
                             print("等待60秒后重新尝试提交（本槽位下一轮再试）")
                         else:
@@ -1129,8 +1184,8 @@ def main(project_dir, debug_login: bool = False, models=None):
             if not picked:
                 continue
 
-        # 3) 保存 Excel
-        df.to_excel(excel_path, index=False)
+        # 3) 保存 Excel（补提交后再写一次，避免中途退出丢失本轮提交）
+        safe_write_excel(df, excel_path)
         print("Excel文件已更新")
 
         # 4) 退出条件：所有行均已结束（成功落盘 / 超时等 is_done_row）
