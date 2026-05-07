@@ -19,15 +19,34 @@ from typing import List, Optional
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 
-def safe_write_excel(df: pd.DataFrame, excel_path: str) -> None:
-    """尽量原子写入 xlsx。Windows 下若目标正被 Excel 独占，os.replace 会 PermissionError，此处重试并降级，不至于崩溃。"""
+def assert_storyboard_excel_writable(excel_path: str) -> None:
+    """启动前检测：目标 xlsx 能否被本进程独占打开（与 pandas 写入所需权限一致）。被 Excel 占用时常失败。"""
+    excel_path = os.path.abspath(excel_path)
+    if not os.path.isfile(excel_path):
+        return
+    flags = os.O_RDWR
+    if os.name == "nt":
+        flags |= os.O_BINARY
+    try:
+        fd = os.open(excel_path, flags)
+        os.close(fd)
+    except OSError as e:
+        raise RuntimeError(
+            "无法独占访问分镜 Excel，可能被 Excel、WPS 或其他程序打开。\n"
+            "请先关闭该表格后再启动本程序（运行期间也不要打开同一文件）。\n"
+            f"文件：{excel_path}\n"
+            f"错误：{e}"
+        ) from e
+
+
+def safe_write_excel(df: pd.DataFrame, excel_path: str) -> bool:
+    """尽量原子写入 xlsx。失败时返回 False（已成功返回 True）。"""
     excel_path = os.path.abspath(excel_path)
     d = os.path.dirname(excel_path)
     os.makedirs(d, exist_ok=True)
     stem = os.path.splitext(os.path.basename(excel_path))[0]
     pid = os.getpid()
     tid = threading.get_ident()
-    # 前缀不以 . 开头，避免个别环境下对「隐藏临时文件」附加策略干扰
     fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", prefix=f"{stem}.tmp.{pid}.{tid}.", dir=d)
     os.close(fd)
     tmp_to_remove = tmp_path
@@ -39,20 +58,38 @@ def safe_write_excel(df: pd.DataFrame, excel_path: str) -> None:
             try:
                 os.replace(tmp_path, excel_path)
                 tmp_to_remove = None
-                return
+                return True
             except (PermissionError, OSError):
                 continue
         try:
             df.to_excel(excel_path, index=False)
             tmp_to_remove = None
-            return
+            return True
         except (PermissionError, OSError) as e:
             print(
                 "警告：无法写入分镜 Excel（文件可能被 Excel 或其他程序打开并锁定）。\n"
                 "请先关闭该 .xlsx 后再运行；运行期间尽量不要用 Excel 打开同一文件。\n"
                 f"路径：{excel_path}\n错误：{e}"
             )
-            return
+            # 补救：临时文件已是完整 xlsx，写到另一文件名通常不被占用占锁
+            backup_path = os.path.join(d, f"{stem}.自动保存.xlsx")
+            recovered = False
+            try:
+                os.replace(tmp_path, backup_path)
+                tmp_to_remove = None
+                recovered = True
+            except OSError:
+                try:
+                    df.to_excel(backup_path, index=False)
+                    recovered = True
+                except OSError as e2:
+                    print(f"补救失败：无法写入备用文件。\n路径：{backup_path}\n错误：{e2}")
+            if recovered:
+                print(
+                    "补救：最新数据已写入备用文件。关闭主表后可用该文件覆盖原分镜表，或复制合并：\n"
+                    f"{backup_path}"
+                )
+            return False
     finally:
         if tmp_to_remove and os.path.exists(tmp_to_remove):
             try:
@@ -938,20 +975,26 @@ def main(project_dir, debug_login: bool = False, models=None):
         os.makedirs(os.path.join(project_dir, "output_videos"), exist_ok=True)
         print(f"已创建默认项目目录：{project_dir}")
 
-    # 启动先确保登录态可用（否则后续 query/text2video 会失败）
-    ensure_dreamina_logged_in(debug_login=debug_login)
-    # 登录态可用后，再检查账号是否具备 dreamina_cli 权限
-    ensure_dreamina_maestro()
-
     project_name = get_project_name(project_dir)
 
-    # 读取Excel文件
+    # 读取Excel路径（先于登录：避免账号就绪后才发现表格被占用）
     excel_path = os.path.join(project_dir, f"{project_name}分镜.xlsx")
     if not os.path.exists(excel_path):
         print(f"文件 {excel_path} 不存在")
         print("请将分镜Excel放入项目目录后重试。")
         return
-    
+
+    try:
+        assert_storyboard_excel_writable(excel_path)
+    except RuntimeError as e:
+        print(str(e))
+        return
+
+    # 启动先确保登录态可用（否则后续 query/text2video 会失败）
+    ensure_dreamina_logged_in(debug_login=debug_login)
+    # 登录态可用后，再检查账号是否具备 dreamina_cli 权限
+    ensure_dreamina_maestro()
+
     # 创建输出目录
     output_dir = os.path.join(project_dir, "output_videos")
     os.makedirs(output_dir, exist_ok=True)
@@ -1126,8 +1169,8 @@ def main(project_dir, debug_login: bool = False, models=None):
 
             print(f"未知任务状态：{status}")
 
-        safe_write_excel(df, excel_path)
-        print("轮询阶段结果已写入 Excel")
+        if safe_write_excel(df, excel_path):
+            print("轮询阶段结果已写入 Excel")
 
         # 2) 按槽位补提交：每个空闲槽位立刻尝试补一条，保持至多 N 条在途（槽 i -> model_list[i]）
         #    已有任务ID（含「生成中」）的行只参与上面轮询，不得进入补提交。
@@ -1206,8 +1249,8 @@ def main(project_dir, debug_login: bool = False, models=None):
                 continue
 
         # 3) 保存 Excel（补提交后再写一次，避免中途退出丢失本轮提交）
-        safe_write_excel(df, excel_path)
-        print("Excel文件已更新")
+        if safe_write_excel(df, excel_path):
+            print("Excel文件已更新")
 
         # 4) 退出条件：所有行均已结束（成功落盘 / 超时等 is_done_row）
         if not any((not is_done_row(r)) for _, r in df.iterrows()):
