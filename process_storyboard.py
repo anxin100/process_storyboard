@@ -1090,175 +1090,187 @@ def main(project_dir, debug_login: bool = False, models=None):
     hydrate_slots_from_excel()
 
     # 主循环：每隔 60 秒轮询一次所有未结束任务；按槽位补提交保持至多 N 条在途
-    while True:
-        poll_inflight = False
-
-        # 1) 轮询所有未结束的任务ID（不再卡住单个 ID）
-        for index, row in df.iterrows():
-            if is_done_row(row):
-                continue
-
-            task_id = _tid_str(row)
-            if not task_id:
-                st = row.get("状态", "")
-                if not pd.isna(st) and str(st).strip() == "生成中":
-                    print(
-                        f"警告：编号 {row.get('编号', 'N/A')} 状态为「生成中」但任务ID为空，无法轮询；"
-                        "请检查 Excel 或清空状态列后重试。"
-                    )
-                continue
-
-            print(f"处理编号 {row.get('编号', 'N/A')}：任务ID = {task_id}")
-            status, data = query_task_status(task_id)
-            if status is None:
-                print(f"查询任务状态失败：{data}")
-                continue
-
-            if status in ['queued', 'generating', 'querying']:
-                # 超时判定：超过 5 小时仍未结束则标记为超时并停止轮询
-                submitted_at = row.get('提交时间', '')
-                if pd.isna(submitted_at):
-                    submitted_at = ''
-                submitted_at = str(submitted_at).strip()
-                if not submitted_at:
-                    submitted_at = now_rfc3339_z()
-                    df.at[index, '提交时间'] = submitted_at
-                try:
-                    start = parse_rfc3339(submitted_at).astimezone(timezone.utc)
-                    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-                    if elapsed > 5 * 3600:
-                        df.at[index, '状态'] = '超时'
-                        print(f"任务超时：已超过5小时（编号 {row.get('编号', 'N/A')}，任务ID={task_id}）")
-                        release_slot(index)
-                        continue
-                except Exception:
-                    # 提交时间解析失败则重置
-                    df.at[index, '提交时间'] = now_rfc3339_z()
-                poll_inflight = True
-                continue
-
-            if status == 'success':
-                output_file = os.path.join(output_dir, f"{row.get('编号', 'N/A')}_{task_id}.mp4")
-                if download_video_http(task_id, output_file, data):
-                    df.at[index, '视频位置'] = output_file
-                    df.at[index, '状态'] = '成功'
-                    df.at[index, '视频是否保存'] = '是'
-                    print(f"视频下载成功：{output_file}")
-                    release_slot(index)
-                else:
-                    print("视频下载失败")
-                continue
-
-            if status in ['rejected', 'cancelled']:
-                print(f"任务状态：{status}，清空任务ID")
-                df.at[index, '任务ID'] = ''
-                df.at[index, '状态'] = ''
-                release_slot(index)
-                continue
-
-            if status == 'fail':
-                fail_reason = (data or {}).get('fail_reason', '未知失败原因')
-                print(f"任务失败：{fail_reason}")
-                # 保留任务ID，仅写入状态供人工核对；不自动清空任务ID（避免误删可追溯记录）
-                short = str(fail_reason).replace("\r", " ").replace("\n", "; ")
-                if len(short) > 300:
-                    short = short[:297] + "..."
-                df.at[index, '状态'] = f"失败：{short}"
-                release_slot(index)
-                continue
-
-            print(f"未知任务状态：{status}")
-
-        if safe_write_excel(df, excel_path):
-            print("轮询阶段结果已写入 Excel")
-
-        # 2) 按槽位补提交：每个空闲槽位立刻尝试补一条，保持至多 N 条在途（槽 i -> model_list[i]）
-        #    已有任务ID（含「生成中」）的行只参与上面轮询，不得进入补提交。
-        #    同一轮补提交内，禁止多槽对同一行尝试（API 失败未写入任务ID 时，否则两槽会重复提交同一分镜）。
-        occupied_by_slot = {idx for idx in slot_busy if idx is not None}
-        submit_attempted_this_round: set = set()
-
-        for si in range(n_slots):
-            if slot_busy[si] is not None:
-                continue
-            mv = model_list[si]
-            picked = False
+    try:
+        while True:
+            poll_inflight = False
+    
+            # 1) 轮询所有未结束的任务ID（不再卡住单个 ID）
             for index, row in df.iterrows():
                 if is_done_row(row):
                     continue
-                if index in occupied_by_slot:
+    
+                task_id = _tid_str(row)
+                if not task_id:
+                    st = row.get("状态", "")
+                    if not pd.isna(st) and str(st).strip() == "生成中":
+                        print(
+                            f"警告：编号 {row.get('编号', 'N/A')} 状态为「生成中」但任务ID为空，无法轮询；"
+                            "请检查 Excel 或清空状态列后重试。"
+                        )
                     continue
-                if index in submit_attempted_this_round:
+    
+                print(f"处理编号 {row.get('编号', 'N/A')}：任务ID = {task_id}")
+                status, data = query_task_status(task_id)
+                if status is None:
+                    print(f"查询任务状态失败：{data}")
                     continue
-                if _should_skip_for_submit(row):
-                    continue
-                original_prompt = row.get('视频提示词', '')
-                if pd.isna(original_prompt) or not str(original_prompt).strip():
-                    continue
-
-                scene = row.get('场景', '')
-                if pd.isna(scene):
-                    scene = ''
-                scene_str = f"场景=@{scene}.png。" if scene else ""
-
-                character_images = row.get('角色图', '')
-                if pd.isna(character_images):
-                    character_images = ''
-                character_str = ""
-                if character_images:
-                    import re
-                    characters = re.split('[，,]', character_images)
-                    characters = [c.strip() for c in characters if c.strip()]
-                    if characters:
-                        character_parts = [f"{c}=@{c}.png" for c in characters]
-                        character_str = "，".join(character_parts) + "。"
-
-                prompt = scene_str + character_str + original_prompt
-                print(f"----------------------------------------------------------------")
-                print(f"生成视频：编号 {row.get('编号', 'N/A')}（槽位 {si + 1}/{n_slots}，模型 {mv}）")
-
-                screen_size = row.get('屏幕尺寸', '横屏')
-                if pd.isna(screen_size):
-                    screen_size = '横屏'
-
-                submit_attempted_this_round.add(index)
-
-                submit_id, error = generate_video(prompt, scene, character_images, project_dir, screen_size, model_version=mv)
-                picked = True
-                if submit_id:
-                    if isinstance(error, tuple) and error[0] == 'fail':
-                        _status, fail_reason = error
-                        print(f"任务提交失败：{fail_reason}")
-                        need_retry = any(keyword in fail_reason for keyword in submit_retry_keywords)
-                        if need_retry:
-                            print("等待60秒后重新尝试提交（本槽位下一轮再试）")
-                        else:
-                            df.at[index, '状态'] = '失败'
-                    else:
-                        df.at[index, '任务ID'] = submit_id
-                        df.at[index, '状态'] = '生成中'
+    
+                if status in ['queued', 'generating', 'querying']:
+                    # 超时判定：超过 5 小时仍未结束则标记为超时并停止轮询
+                    submitted_at = row.get('提交时间', '')
+                    if pd.isna(submitted_at):
+                        submitted_at = ''
+                    submitted_at = str(submitted_at).strip()
+                    if not submitted_at:
+                        submitted_at = now_rfc3339_z()
+                        df.at[index, '提交时间'] = submitted_at
+                    try:
+                        start = parse_rfc3339(submitted_at).astimezone(timezone.utc)
+                        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+                        if elapsed > 5 * 3600:
+                            df.at[index, '状态'] = '超时'
+                            print(f"任务超时：已超过5小时（编号 {row.get('编号', 'N/A')}，任务ID={task_id}）")
+                            release_slot(index)
+                            continue
+                    except Exception:
+                        # 提交时间解析失败则重置
                         df.at[index, '提交时间'] = now_rfc3339_z()
-                        print(f"生成任务已提交：{submit_id}")
-                        slot_busy[si] = index
-                        occupied_by_slot.add(index)
-                else:
-                    print(f"生成视频失败：{error}")
-                    df.at[index, '状态'] = '失败'
-                break
-            if not picked:
-                continue
+                    poll_inflight = True
+                    continue
+    
+                if status == 'success':
+                    output_file = os.path.join(output_dir, f"{row.get('编号', 'N/A')}_{task_id}.mp4")
+                    if download_video_http(task_id, output_file, data):
+                        df.at[index, '视频位置'] = output_file
+                        df.at[index, '状态'] = '成功'
+                        df.at[index, '视频是否保存'] = '是'
+                        print(f"视频下载成功：{output_file}")
+                        release_slot(index)
+                    else:
+                        print("视频下载失败")
+                    continue
+    
+                if status in ['rejected', 'cancelled']:
+                    print(f"任务状态：{status}，清空任务ID")
+                    df.at[index, '任务ID'] = ''
+                    df.at[index, '状态'] = ''
+                    release_slot(index)
+                    continue
+    
+                if status == 'fail':
+                    fail_reason = (data or {}).get('fail_reason', '未知失败原因')
+                    print(f"任务失败：{fail_reason}")
+                    # 保留任务ID，仅写入状态供人工核对；不自动清空任务ID（避免误删可追溯记录）
+                    short = str(fail_reason).replace("\r", " ").replace("\n", "; ")
+                    if len(short) > 300:
+                        short = short[:297] + "..."
+                    df.at[index, '状态'] = f"失败：{short}"
+                    release_slot(index)
+                    continue
+    
+                print(f"未知任务状态：{status}")
+    
+            if safe_write_excel(df, excel_path):
+                print("轮询阶段结果已写入 Excel")
+    
+            # 2) 按槽位补提交：每个空闲槽位立刻尝试补一条，保持至多 N 条在途（槽 i -> model_list[i]）
+            #    已有任务ID（含「生成中」）的行只参与上面轮询，不得进入补提交。
+            #    同一轮补提交内，禁止多槽对同一行尝试（API 失败未写入任务ID 时，否则两槽会重复提交同一分镜）。
+            occupied_by_slot = {idx for idx in slot_busy if idx is not None}
+            submit_attempted_this_round: set = set()
+    
+            for si in range(n_slots):
+                if slot_busy[si] is not None:
+                    continue
+                mv = model_list[si]
+                picked = False
+                for index, row in df.iterrows():
+                    if is_done_row(row):
+                        continue
+                    if index in occupied_by_slot:
+                        continue
+                    if index in submit_attempted_this_round:
+                        continue
+                    if _should_skip_for_submit(row):
+                        continue
+                    original_prompt = row.get('视频提示词', '')
+                    if pd.isna(original_prompt) or not str(original_prompt).strip():
+                        continue
+    
+                    scene = row.get('场景', '')
+                    if pd.isna(scene):
+                        scene = ''
+                    scene_str = f"场景=@{scene}.png。" if scene else ""
+    
+                    character_images = row.get('角色图', '')
+                    if pd.isna(character_images):
+                        character_images = ''
+                    character_str = ""
+                    if character_images:
+                        import re
+                        characters = re.split('[，,]', character_images)
+                        characters = [c.strip() for c in characters if c.strip()]
+                        if characters:
+                            character_parts = [f"{c}=@{c}.png" for c in characters]
+                            character_str = "，".join(character_parts) + "。"
+    
+                    prompt = scene_str + character_str + original_prompt
+                    print(f"----------------------------------------------------------------")
+                    print(f"生成视频：编号 {row.get('编号', 'N/A')}（槽位 {si + 1}/{n_slots}，模型 {mv}）")
+    
+                    screen_size = row.get('屏幕尺寸', '横屏')
+                    if pd.isna(screen_size):
+                        screen_size = '横屏'
+    
+                    submit_attempted_this_round.add(index)
+    
+                    submit_id, error = generate_video(prompt, scene, character_images, project_dir, screen_size, model_version=mv)
+                    picked = True
+                    if submit_id:
+                        if isinstance(error, tuple) and error[0] == 'fail':
+                            _status, fail_reason = error
+                            print(f"任务提交失败：{fail_reason}")
+                            need_retry = any(keyword in fail_reason for keyword in submit_retry_keywords)
+                            if need_retry:
+                                print("等待60秒后重新尝试提交（本槽位下一轮再试）")
+                            else:
+                                df.at[index, '状态'] = '失败'
+                        else:
+                            df.at[index, '任务ID'] = submit_id
+                            df.at[index, '状态'] = '生成中'
+                            df.at[index, '提交时间'] = now_rfc3339_z()
+                            print(f"生成任务已提交：{submit_id}")
+                            slot_busy[si] = index
+                            occupied_by_slot.add(index)
+                    else:
+                        print(f"生成视频失败：{error}")
+                        df.at[index, '状态'] = '失败'
+                    break
+                if not picked:
+                    continue
+    
+            # 3) 保存 Excel（补提交后再写一次，避免中途退出丢失本轮提交）
+            if safe_write_excel(df, excel_path):
+                print("Excel文件已更新")
+    
+            # 4) 退出条件：所有行均已结束（成功落盘 / 超时等 is_done_row）
+            if not any((not is_done_row(r)) for _, r in df.iterrows()):
+                print("所有任务处理完成，退出脚本")
+                return
+    
+            print("等待60秒后轮询所有未结束任务")
+            time.sleep(60)
 
-        # 3) 保存 Excel（补提交后再写一次，避免中途退出丢失本轮提交）
+    except KeyboardInterrupt:
+        print("\n收到中断，正在尝试保存分镜 Excel…")
         if safe_write_excel(df, excel_path):
-            print("Excel文件已更新")
-
-        # 4) 退出条件：所有行均已结束（成功落盘 / 超时等 is_done_row）
-        if not any((not is_done_row(r)) for _, r in df.iterrows()):
-            print("所有任务处理完成，退出脚本")
-            return
-
-        print("等待60秒后轮询所有未结束任务")
-        time.sleep(60)
+            print("已保存当前进度并退出。")
+        else:
+            print(
+                "未能写入主表（可能被占用）。若已生成同目录下的「.自动保存.xlsx」，"
+                "关闭表格程序后可用该文件覆盖或合并。"
+            )
+        return
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="根据分镜Excel批量生成/下载视频")
