@@ -29,8 +29,8 @@ Write-Host '请输入项目目录（可填绝对/相对路径，直接回车=使
 $projectDir = Read-Host
 
 Write-Host ''
-Write-Host '请输入模型列表（英文逗号分隔，不要空格）。直接回车=使用默认单模型 seedance2.0fast'
-Write-Host '示例: seedance2.0fast,seedance2.0pro'
+Write-Host '请输入模型列表（英文逗号分隔，不要空格）。直接回车=默认两模型 seedance2.0fast,seedance2.0'
+Write-Host '示例: seedance2.0fast,seedance2.0   单模型示例: seedance2.0fast'
 $models = Read-Host
 
 Write-Host ''

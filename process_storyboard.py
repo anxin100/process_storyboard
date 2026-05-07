@@ -1044,7 +1044,7 @@ def main(project_dir, debug_login: bool = False, models=None):
 
     model_list = [m.strip() for m in (models or []) if str(m).strip()]
     if not model_list:
-        model_list = ["seedance2.0fast"]
+        model_list = ["seedance2.0fast", "seedance2.0"]
 
     n_slots = len(model_list)
     # 槽位 i 对应模型 model_list[i]；值为当前占用该槽的 DataFrame 行索引，None 表示空闲
@@ -1302,7 +1302,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--models",
         default="",
-        help="多模型模式：逗号分隔模型列表，槽位数=列表长度；每个槽绑定一个模型，在途任务结束即在该槽补提交下一条。轮询每60秒扫表内所有未结束任务。",
+        help="多模型模式：逗号分隔模型列表，槽位数=列表长度；每个槽绑定一个模型，在途任务结束即在该槽补提交下一条。轮询每60秒扫表内所有未结束任务。默认：seedance2.0fast,seedance2.0。",
     )
     args = parser.parse_args()
     if args.logout:
